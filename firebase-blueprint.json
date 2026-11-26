@@ -1,0 +1,290 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil privado do usuário com vínculo familiar e configurações pessoais.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "email": { "type": "string", "minLength": 3, "maxLength": 150 },
+        "role": { "type": "string", "enum": ["marido", "esposa", "familiar"] },
+        "familyId": { "type": "string", "maxLength": 128 },
+        "onboardingCompleted": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "email", "role", "onboardingCompleted", "createdAt", "updatedAt"]
+    },
+    "Family": {
+      "title": "Family",
+      "description": "Unidade familiar compartilhada entre cônjuges e integrantes.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "inviteCode": { "type": "string", "minLength": 6, "maxLength": 16, "pattern": "^[A-Z0-9]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "ownerId", "inviteCode", "createdAt", "updatedAt"]
+    },
+    "FamilyInvite": {
+      "title": "FamilyInvite",
+      "description": "Código de convite para ingresso seguro de um integrante na família.",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string", "minLength": 6, "maxLength": 16, "pattern": "^[A-Z0-9]+$" },
+        "familyId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "familyName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["code", "familyId", "familyName", "createdBy", "active", "createdAt"]
+    },
+    "FamilyMember": {
+      "title": "FamilyMember",
+      "description": "Integrante ativo da família (dados não sensíveis para exibição compartilhada).",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "role": { "type": "string", "enum": ["marido", "esposa", "familiar"] },
+        "inviteCode": { "type": "string", "maxLength": 16 },
+        "joinedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "role", "joinedAt"]
+    },
+    "Income": {
+      "title": "Income",
+      "description": "Lançamento de receita familiar.",
+      "type": "object",
+      "properties": {
+        "description": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "category": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "responsibleName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "responsibleUid": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["description", "amount", "date", "category", "responsibleName", "createdByUid", "createdByName", "createdAt", "updatedAt"]
+    },
+    "Expense": {
+      "title": "Expense",
+      "description": "Lançamento de despesa familiar com categoria, subcategoria e suporte a parcelamento.",
+      "type": "object",
+      "properties": {
+        "description": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "category": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "subcategory": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "paymentMethod": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "responsibleName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "responsibleUid": { "type": "string", "maxLength": 128 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["pago", "pendente"] },
+        "isInstallment": { "type": "boolean" },
+        "installmentGroupId": { "type": "string", "maxLength": 128 },
+        "installmentNumber": { "type": "number" },
+        "totalInstallments": { "type": "number" },
+        "isRecurring": { "type": "boolean" },
+        "fixedBillId": { "type": "string", "maxLength": 128 },
+        "referenceMonth": { "type": "string", "maxLength": 7 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["description", "category", "subcategory", "amount", "date", "paymentMethod", "responsibleName", "status", "isInstallment", "isRecurring", "createdByUid", "createdByName", "createdAt", "updatedAt"]
+    },
+    "FixedBill": {
+      "title": "FixedBill",
+      "description": "Conta fixa recorrente mensal ou periódica da família.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "expectedAmount": { "type": "number" },
+        "dueDay": { "type": "number" },
+        "frequency": { "type": "string", "enum": ["mensal", "bimestral", "trimestral", "anual"] },
+        "category": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "subcategory": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "lastPaidMonth": { "type": "string", "maxLength": 7 },
+        "lastPaidDate": { "type": "string", "maxLength": 10 },
+        "lastPaidAmount": { "type": "number" },
+        "active": { "type": "boolean" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "expectedAmount", "dueDay", "frequency", "category", "subcategory", "lastPaidMonth", "lastPaidDate", "lastPaidAmount", "active", "createdByUid", "createdByName", "createdAt", "updatedAt"]
+    },
+    "Debt": {
+      "title": "Debt",
+      "description": "Dívida familiar com controle de parcelas, juros e quitação.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "creditor": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "originalAmount": { "type": "number" },
+        "currentAmount": { "type": "number" },
+        "installmentAmount": { "type": "number" },
+        "totalInstallments": { "type": "number" },
+        "paidInstallments": { "type": "number" },
+        "interestRate": { "type": "number" },
+        "dueDate": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "status": { "type": "string", "enum": ["ativa", "quitada"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "creditor", "originalAmount", "currentAmount", "installmentAmount", "totalInstallments", "paidInstallments", "interestRate", "dueDate", "status", "createdByUid", "createdByName", "createdAt", "updatedAt"]
+    },
+    "DebtPayment": {
+      "title": "DebtPayment",
+      "description": "Registro de pagamento parcial, de parcela ou quitação de dívida.",
+      "type": "object",
+      "properties": {
+        "debtId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "debtName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "paymentType": { "type": "string", "enum": ["parcela", "parcial", "quitacao"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["debtId", "debtName", "amount", "date", "paymentType", "createdByUid", "createdByName", "createdAt"]
+    },
+    "ReserveGoal": {
+      "title": "ReserveGoal",
+      "description": "Meta da reserva financeira familiar (Nosso Cofrinho).",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "targetAmount": { "type": "number" },
+        "currentAmount": { "type": "number" },
+        "monthlyContribution": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "targetAmount", "currentAmount", "monthlyContribution", "createdByUid", "createdByName", "createdAt", "updatedAt"]
+    },
+    "ReserveMovement": {
+      "title": "ReserveMovement",
+      "description": "Depósito ou retirada realizada na reserva financeira familiar.",
+      "type": "object",
+      "properties": {
+        "goalId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "goalName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "type": { "type": "string", "enum": ["deposito", "retirada"] },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "minLength": 10, "maxLength": 10, "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["goalId", "goalName", "type", "amount", "date", "createdByUid", "createdByName", "createdAt"]
+    },
+    "Budget": {
+      "title": "Budget",
+      "description": "Limite mensal de gastos planejado por categoria.",
+      "type": "object",
+      "properties": {
+        "category": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "monthlyLimit": { "type": "number" },
+        "month": { "type": "string", "minLength": 6, "maxLength": 7 },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["category", "monthlyLimit", "month", "createdByUid", "createdByName", "createdAt", "updatedAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Histórico imutável de ações financeiras importantes para transparência familiar.",
+      "type": "object",
+      "properties": {
+        "action": { "type": "string", "enum": ["criar", "editar", "excluir", "pagamento", "reserva"] },
+        "entityType": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "entityId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 240 },
+        "amount": { "type": "number" },
+        "performedByUid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "performedByName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["action", "entityType", "entityId", "summary", "performedByUid", "performedByName", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Dados privados do perfil do usuário autenticado."
+    },
+    "/familyInvites/{inviteCode}": {
+      "schema": { "$ref": "#/entities/FamilyInvite" },
+      "description": "Convites de família buscáveis apenas pelo código exato."
+    },
+    "/families/{familyId}": {
+      "schema": { "$ref": "#/entities/Family" },
+      "description": "Documento mestre da família."
+    },
+    "/families/{familyId}/members/{memberId}": {
+      "schema": { "$ref": "#/entities/FamilyMember" },
+      "description": "Integrantes ativos vinculados à família."
+    },
+    "/families/{familyId}/incomes/{incomeId}": {
+      "schema": { "$ref": "#/entities/Income" },
+      "description": "Receitas da família."
+    },
+    "/families/{familyId}/expenses/{expenseId}": {
+      "schema": { "$ref": "#/entities/Expense" },
+      "description": "Despesas da família."
+    },
+    "/families/{familyId}/fixedBills/{billId}": {
+      "schema": { "$ref": "#/entities/FixedBill" },
+      "description": "Contas fixas recorrentes da família."
+    },
+    "/families/{familyId}/debts/{debtId}": {
+      "schema": { "$ref": "#/entities/Debt" },
+      "description": "Dívidas da família."
+    },
+    "/families/{familyId}/debtPayments/{paymentId}": {
+      "schema": { "$ref": "#/entities/DebtPayment" },
+      "description": "Pagamentos realizados em dívidas."
+    },
+    "/families/{familyId}/reserves/{goalId}": {
+      "schema": { "$ref": "#/entities/ReserveGoal" },
+      "description": "Metas da reserva financeira familiar."
+    },
+    "/families/{familyId}/reserveMovements/{movementId}": {
+      "schema": { "$ref": "#/entities/ReserveMovement" },
+      "description": "Depósitos e retiradas na reserva financeira."
+    },
+    "/families/{familyId}/budgets/{budgetId}": {
+      "schema": { "$ref": "#/entities/Budget" },
+      "description": "Planejamentos mensais de orçamento por categoria."
+    },
+    "/families/{familyId}/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Registro de transparência das alterações financeiras."
+    }
+  }
+}

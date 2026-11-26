@@ -1,0 +1,8 @@
+{
+  "name": "Blessed Finance",
+  "description": "Plataforma completa de controle financeiro familiar compartilhado para casais e famílias organizarem receitas, despesas, contas fixas, dívidas, reservas e planejamento mensal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

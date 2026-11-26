@@ -1,0 +1,486 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Global Helpers ---
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidDateStr(d) {
+      return d is string && d.size() == 10 && d.matches('^\\d{4}-\\d{2}-\\d{2}$');
+    }
+
+    function isValidMonthStr(m) {
+      return m is string && (m == '' || (m.size() == 7 && m.matches('^\\d{4}-\\d{2}$')));
+    }
+
+    function isFamilyMember(familyId) {
+      return isVerified() && exists(/databases/$(database)/documents/families/$(familyId)/members/$(request.auth.uid));
+    }
+
+    function isFamilyOwner(familyId) {
+      return isVerified() && get(/databases/$(database)/documents/families/$(familyId)).data.ownerId == request.auth.uid;
+    }
+
+    // --- Validation Blueprints ---
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'email', 'role', 'onboardingCompleted', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'email', 'role', 'familyId', 'onboardingCompleted', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid == request.auth.uid
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 150
+        && data.role in ['marido', 'esposa', 'familiar']
+        && (!('familyId' in data) || data.familyId == null || isValidId(data.familyId))
+        && data.onboardingCompleted is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFamily(data) {
+      return data.keys().hasAll(['name', 'ownerId', 'inviteCode', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'ownerId', 'inviteCode', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && isValidId(data.ownerId)
+        && data.inviteCode is string && data.inviteCode.size() >= 6 && data.inviteCode.size() <= 16 && data.inviteCode.matches('^[A-Z0-9]+$')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFamilyInvite(data, inviteCode) {
+      return data.keys().hasAll(['code', 'familyId', 'familyName', 'createdBy', 'active', 'createdAt'])
+        && data.keys().hasOnly(['code', 'familyId', 'familyName', 'createdBy', 'active', 'createdAt'])
+        && data.code is string && data.code == inviteCode && data.code.size() >= 6 && data.code.size() <= 16 && data.code.matches('^[A-Z0-9]+$')
+        && isValidId(data.familyId)
+        && data.familyName is string && data.familyName.size() >= 1 && data.familyName.size() <= 80
+        && isValidId(data.createdBy)
+        && data.active is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidFamilyMember(data, memberId) {
+      return data.keys().hasAll(['uid', 'displayName', 'role', 'joinedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'role', 'inviteCode', 'joinedAt'])
+        && isValidId(data.uid) && data.uid == memberId
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && data.role in ['marido', 'esposa', 'familiar']
+        && (!('inviteCode' in data) || (data.inviteCode is string && data.inviteCode.size() <= 16))
+        && data.joinedAt is timestamp;
+    }
+
+    function isValidIncome(data) {
+      return data.keys().hasAll(['description', 'amount', 'date', 'category', 'responsibleName', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['description', 'amount', 'date', 'category', 'responsibleName', 'responsibleUid', 'notes', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 140
+        && data.amount is number && data.amount > 0 && data.amount <= 100000000
+        && isValidDateStr(data.date)
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+        && data.responsibleName is string && data.responsibleName.size() >= 1 && data.responsibleName.size() <= 80
+        && (!('responsibleUid' in data) || data.responsibleUid == '' || isValidId(data.responsibleUid))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidExpense(data) {
+      return data.keys().hasAll(['description', 'category', 'subcategory', 'amount', 'date', 'paymentMethod', 'responsibleName', 'status', 'isInstallment', 'isRecurring', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['description', 'category', 'subcategory', 'amount', 'date', 'paymentMethod', 'responsibleName', 'responsibleUid', 'notes', 'status', 'isInstallment', 'installmentGroupId', 'installmentNumber', 'totalInstallments', 'isRecurring', 'fixedBillId', 'referenceMonth', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 140
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+        && data.subcategory is string && data.subcategory.size() >= 1 && data.subcategory.size() <= 60
+        && data.amount is number && data.amount > 0 && data.amount <= 100000000
+        && isValidDateStr(data.date)
+        && data.paymentMethod is string && data.paymentMethod.size() >= 1 && data.paymentMethod.size() <= 40
+        && data.responsibleName is string && data.responsibleName.size() >= 1 && data.responsibleName.size() <= 80
+        && (!('responsibleUid' in data) || data.responsibleUid == '' || isValidId(data.responsibleUid))
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && data.status in ['pago', 'pendente']
+        && data.isInstallment is bool
+        && (!('installmentGroupId' in data) || (data.installmentGroupId is string && data.installmentGroupId.size() <= 128))
+        && (!('installmentNumber' in data) || (data.installmentNumber is number && data.installmentNumber >= 1 && data.installmentNumber <= 360))
+        && (!('totalInstallments' in data) || (data.totalInstallments is number && data.totalInstallments >= 1 && data.totalInstallments <= 360))
+        && data.isRecurring is bool
+        && (!('fixedBillId' in data) || (data.fixedBillId is string && data.fixedBillId.size() <= 128))
+        && (!('referenceMonth' in data) || isValidMonthStr(data.referenceMonth))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFixedBill(data) {
+      return data.keys().hasAll(['name', 'expectedAmount', 'dueDay', 'frequency', 'category', 'subcategory', 'lastPaidMonth', 'lastPaidDate', 'lastPaidAmount', 'active', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'expectedAmount', 'dueDay', 'frequency', 'category', 'subcategory', 'lastPaidMonth', 'lastPaidDate', 'lastPaidAmount', 'active', 'notes', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && data.expectedAmount is number && data.expectedAmount > 0 && data.expectedAmount <= 100000000
+        && data.dueDay is number && data.dueDay >= 1 && data.dueDay <= 31
+        && data.frequency in ['mensal', 'bimestral', 'trimestral', 'anual']
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+        && data.subcategory is string && data.subcategory.size() >= 1 && data.subcategory.size() <= 60
+        && isValidMonthStr(data.lastPaidMonth)
+        && (data.lastPaidDate == '' || isValidDateStr(data.lastPaidDate))
+        && data.lastPaidAmount is number && data.lastPaidAmount >= 0 && data.lastPaidAmount <= 100000000
+        && data.active is bool
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDebt(data) {
+      return data.keys().hasAll(['name', 'creditor', 'originalAmount', 'currentAmount', 'installmentAmount', 'totalInstallments', 'paidInstallments', 'interestRate', 'dueDate', 'status', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'creditor', 'originalAmount', 'currentAmount', 'installmentAmount', 'totalInstallments', 'paidInstallments', 'interestRate', 'dueDate', 'status', 'notes', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && data.creditor is string && data.creditor.size() >= 1 && data.creditor.size() <= 100
+        && data.originalAmount is number && data.originalAmount > 0 && data.originalAmount <= 100000000
+        && data.currentAmount is number && data.currentAmount >= 0 && data.currentAmount <= 100000000
+        && data.installmentAmount is number && data.installmentAmount >= 0 && data.installmentAmount <= 100000000
+        && data.totalInstallments is number && data.totalInstallments >= 1 && data.totalInstallments <= 600
+        && data.paidInstallments is number && data.paidInstallments >= 0 && data.paidInstallments <= data.totalInstallments
+        && data.interestRate is number && data.interestRate >= 0 && data.interestRate <= 1000
+        && isValidDateStr(data.dueDate)
+        && data.status in ['ativa', 'quitada']
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDebtPayment(data) {
+      return data.keys().hasAll(['debtId', 'debtName', 'amount', 'date', 'paymentType', 'createdByUid', 'createdByName', 'createdAt'])
+        && data.keys().hasOnly(['debtId', 'debtName', 'amount', 'date', 'paymentType', 'notes', 'createdByUid', 'createdByName', 'createdAt'])
+        && isValidId(data.debtId)
+        && data.debtName is string && data.debtName.size() >= 1 && data.debtName.size() <= 100
+        && data.amount is number && data.amount > 0 && data.amount <= 100000000
+        && isValidDateStr(data.date)
+        && data.paymentType in ['parcela', 'parcial', 'quitacao']
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp;
+    }
+
+    function isValidReserveGoal(data) {
+      return data.keys().hasAll(['name', 'targetAmount', 'currentAmount', 'monthlyContribution', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'targetAmount', 'currentAmount', 'monthlyContribution', 'notes', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 100
+        && data.targetAmount is number && data.targetAmount > 0 && data.targetAmount <= 100000000
+        && data.currentAmount is number && data.currentAmount >= 0 && data.currentAmount <= 100000000
+        && data.monthlyContribution is number && data.monthlyContribution >= 0 && data.monthlyContribution <= 100000000
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidReserveMovement(data) {
+      return data.keys().hasAll(['goalId', 'goalName', 'type', 'amount', 'date', 'createdByUid', 'createdByName', 'createdAt'])
+        && data.keys().hasOnly(['goalId', 'goalName', 'type', 'amount', 'date', 'notes', 'createdByUid', 'createdByName', 'createdAt'])
+        && isValidId(data.goalId)
+        && data.goalName is string && data.goalName.size() >= 1 && data.goalName.size() <= 100
+        && data.type in ['deposito', 'retirada']
+        && data.amount is number && data.amount > 0 && data.amount <= 100000000
+        && isValidDateStr(data.date)
+        && (!('notes' in data) || (data.notes is string && data.notes.size() <= 500))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp;
+    }
+
+    function isValidBudget(data) {
+      return data.keys().hasAll(['category', 'monthlyLimit', 'month', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['category', 'monthlyLimit', 'month', 'createdByUid', 'createdByName', 'createdAt', 'updatedAt'])
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 60
+        && data.monthlyLimit is number && data.monthlyLimit >= 0 && data.monthlyLimit <= 100000000
+        && (data.month == 'padrao' || (data.month.size() == 7 && data.month.matches('^\\d{4}-\\d{2}$')))
+        && isValidId(data.createdByUid)
+        && data.createdByName is string && data.createdByName.size() >= 1 && data.createdByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['action', 'entityType', 'entityId', 'summary', 'performedByUid', 'performedByName', 'createdAt'])
+        && data.keys().hasOnly(['action', 'entityType', 'entityId', 'summary', 'amount', 'performedByUid', 'performedByName', 'createdAt'])
+        && data.action in ['criar', 'editar', 'excluir', 'pagamento', 'reserva']
+        && data.entityType is string && data.entityType.size() >= 1 && data.entityType.size() <= 40
+        && isValidId(data.entityId)
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 240
+        && (!('amount' in data) || (data.amount is number && data.amount >= 0 && data.amount <= 100000000))
+        && isValidId(data.performedByUid)
+        && data.performedByName is string && data.performedByName.size() >= 1 && data.performedByName.size() <= 80
+        && data.createdAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+
+    // 1. User Profiles (Strict PII Isolation: owner only)
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if isVerified() && isValidId(userId) && request.auth.uid == userId
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(userId) && request.auth.uid == userId
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role', 'familyId', 'onboardingCompleted', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 2. Family Invites (Lookup only by exact code, no listing)
+    match /familyInvites/{inviteCode} {
+      allow get: if isVerified() && inviteCode is string && inviteCode.size() >= 6 && inviteCode.size() <= 16 && inviteCode.matches('^[A-Z0-9]+$');
+      allow list: if false;
+      allow create: if isVerified() && inviteCode is string && inviteCode.size() >= 6 && inviteCode.size() <= 16
+        && isValidFamilyInvite(incoming(), inviteCode)
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/families/$(incoming().familyId));
+      allow update: if isVerified() && isFamilyOwner(existing().familyId)
+        && isValidFamilyInvite(incoming(), inviteCode)
+        && incoming().code == existing().code
+        && incoming().familyId == existing().familyId
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().diff(existing()).affectedKeys().hasOnly(['active', 'familyName']);
+      allow delete: if isVerified() && isFamilyOwner(existing().familyId);
+    }
+
+    // 3. Families Master Document
+    match /families/{familyId} {
+      allow get: if isValidId(familyId) && isFamilyMember(familyId);
+      allow list: if false;
+      allow create: if isVerified() && isValidId(familyId)
+        && isValidFamily(incoming())
+        && incoming().ownerId == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(familyId) && isFamilyMember(familyId)
+        && isValidFamily(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isFamilyOwner(familyId) && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'inviteCode', 'updatedAt'])) ||
+          (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']))
+        );
+      allow delete: if false;
+
+      // 3a. Members Subcollection (Master Gate source of truth)
+      match /members/{memberId} {
+        allow get: if isValidId(familyId) && isValidId(memberId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isVerified() && isValidId(familyId) && isValidId(memberId)
+          && memberId == request.auth.uid
+          && isValidFamilyMember(incoming(), memberId)
+          && incoming().joinedAt == request.time
+          && (
+            (getAfter(/databases/$(database)/documents/families/$(familyId)).data.ownerId == request.auth.uid) ||
+            ('inviteCode' in incoming()
+              && exists(/databases/$(database)/documents/familyInvites/$(incoming().inviteCode))
+              && get(/databases/$(database)/documents/familyInvites/$(incoming().inviteCode)).data.active == true
+              && get(/databases/$(database)/documents/familyInvites/$(incoming().inviteCode)).data.familyId == familyId)
+          );
+        allow update: if isValidId(familyId) && isValidId(memberId) && isFamilyMember(familyId)
+          && memberId == request.auth.uid
+          && isValidFamilyMember(incoming(), memberId)
+          && incoming().uid == existing().uid
+          && incoming().joinedAt == existing().joinedAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'role']);
+        allow delete: if isValidId(familyId) && isValidId(memberId)
+          && memberId != get(/databases/$(database)/documents/families/$(familyId)).data.ownerId
+          && (memberId == request.auth.uid || isFamilyOwner(familyId));
+      }
+
+      // 3b. Incomes
+      match /incomes/{incomeId} {
+        allow get: if isValidId(familyId) && isValidId(incomeId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(incomeId) && isFamilyMember(familyId)
+          && isValidIncome(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(familyId) && isValidId(incomeId) && isFamilyMember(familyId)
+          && isValidIncome(incoming())
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['description', 'amount', 'date', 'category', 'responsibleName', 'responsibleUid', 'notes', 'updatedAt']);
+        allow delete: if isValidId(familyId) && isValidId(incomeId) && isFamilyMember(familyId);
+      }
+
+      // 3c. Expenses
+      match /expenses/{expenseId} {
+        allow get: if isValidId(familyId) && isValidId(expenseId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(expenseId) && isFamilyMember(familyId)
+          && isValidExpense(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(familyId) && isValidId(expenseId) && isFamilyMember(familyId)
+          && isValidExpense(incoming())
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['description', 'category', 'subcategory', 'amount', 'date', 'paymentMethod', 'responsibleName', 'responsibleUid', 'notes', 'status', 'updatedAt'])
+          );
+        allow delete: if isValidId(familyId) && isValidId(expenseId) && isFamilyMember(familyId);
+      }
+
+      // 3d. Fixed Bills
+      match /fixedBills/{billId} {
+        allow get: if isValidId(familyId) && isValidId(billId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(billId) && isFamilyMember(familyId)
+          && isValidFixedBill(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(familyId) && isValidId(billId) && isFamilyMember(familyId)
+          && isValidFixedBill(incoming())
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['lastPaidMonth', 'lastPaidDate', 'lastPaidAmount', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'expectedAmount', 'dueDay', 'frequency', 'category', 'subcategory', 'active', 'notes', 'updatedAt'])
+          );
+        allow delete: if isValidId(familyId) && isValidId(billId) && isFamilyMember(familyId);
+      }
+
+      // 3e. Debts
+      match /debts/{debtId} {
+        allow get: if isValidId(familyId) && isValidId(debtId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(debtId) && isFamilyMember(familyId)
+          && isValidDebt(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(familyId) && isValidId(debtId) && isFamilyMember(familyId)
+          && isValidDebt(incoming())
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && existing().status != 'quitada'
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['currentAmount', 'paidInstallments', 'status', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'creditor', 'originalAmount', 'currentAmount', 'installmentAmount', 'totalInstallments', 'paidInstallments', 'interestRate', 'dueDate', 'status', 'notes', 'updatedAt'])
+          );
+        allow delete: if isValidId(familyId) && isValidId(debtId) && isFamilyMember(familyId);
+      }
+
+      // 3f. Debt Payments
+      match /debtPayments/{paymentId} {
+        allow get: if isValidId(familyId) && isValidId(paymentId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(paymentId) && isFamilyMember(familyId)
+          && isValidDebtPayment(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/families/$(familyId)/debts/$(incoming().debtId));
+        allow update: if false;
+        allow delete: if isValidId(familyId) && isValidId(paymentId) && isFamilyMember(familyId);
+      }
+
+      // 3g. Reserves (Goals / Cofrinho)
+      match /reserves/{goalId} {
+        allow get: if isValidId(familyId) && isValidId(goalId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(goalId) && isFamilyMember(familyId)
+          && isValidReserveGoal(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(familyId) && isValidId(goalId) && isFamilyMember(familyId)
+          && isValidReserveGoal(incoming())
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly(['currentAmount', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'targetAmount', 'monthlyContribution', 'notes', 'updatedAt'])
+          );
+        allow delete: if isValidId(familyId) && isValidId(goalId) && isFamilyMember(familyId);
+      }
+
+      // 3h. Reserve Movements
+      match /reserveMovements/{movementId} {
+        allow get: if isValidId(familyId) && isValidId(movementId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(movementId) && isFamilyMember(familyId)
+          && isValidReserveMovement(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/families/$(familyId)/reserves/$(incoming().goalId));
+        allow update: if false;
+        allow delete: if isValidId(familyId) && isValidId(movementId) && isFamilyMember(familyId);
+      }
+
+      // 3i. Monthly Budgets
+      match /budgets/{budgetId} {
+        allow get: if isValidId(familyId) && isValidId(budgetId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(budgetId) && isFamilyMember(familyId)
+          && isValidBudget(incoming())
+          && incoming().createdByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(familyId) && isValidId(budgetId) && isFamilyMember(familyId)
+          && isValidBudget(incoming())
+          && incoming().createdByUid == existing().createdByUid
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['monthlyLimit', 'updatedAt']);
+        allow delete: if isValidId(familyId) && isValidId(budgetId) && isFamilyMember(familyId);
+      }
+
+      // 3j. Audit Logs (Append-only family transparency log)
+      match /auditLogs/{logId} {
+        allow get: if isValidId(familyId) && isValidId(logId) && isFamilyMember(familyId);
+        allow list: if isValidId(familyId) && isFamilyMember(familyId);
+        allow create: if isValidId(familyId) && isValidId(logId) && isFamilyMember(familyId)
+          && isValidAuditLog(incoming())
+          && incoming().performedByUid == request.auth.uid
+          && incoming().createdAt == request.time;
+        allow update: if false;
+        allow delete: if false;
+      }
+    }
+  }
+}
