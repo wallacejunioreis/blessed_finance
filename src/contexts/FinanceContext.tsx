@@ -1,4 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import { loadCachedFamilySnapshot, saveCachedFamilySnapshot } from '../db/sessionVault';
 import { apiRequest, subscribeFamilyEvents } from '../services/api';
 import {
   AuditLog,
@@ -141,7 +142,11 @@ interface FinanceContextValue {
   }) => Promise<void>;
   deleteReserveGoal: (goal: ReserveGoal) => Promise<void>;
 
-  saveBudget: (params: { category: string; monthlyLimit: number; existingId?: string }) => Promise<void>;
+  saveBudget: (params: {
+    category: string;
+    monthlyLimit: number;
+    existingId?: string;
+  }) => Promise<void>;
   deleteBudget: (budget: Budget) => Promise<void>;
 
   restoreBackup: (backup: FamilyBackupData, currentPassword: string) => Promise<number>;
@@ -165,17 +170,23 @@ export function FinanceProvider({ children }: { children: React.ReactNode }) {
 
   const familyId = family?.id ?? null;
 
-  const applySnapshot = useCallback((snap: FinanceSnapshot) => {
-    setIncomes(snap.incomes);
-    setExpenses(snap.expenses);
-    setFixedBills(snap.fixedBills);
-    setDebts(snap.debts);
-    setDebtPayments(snap.debtPayments);
-    setReserves(snap.reserves);
-    setReserveMovements(snap.reserveMovements);
-    setBudgets(snap.budgets);
-    setAuditLogs(snap.auditLogs);
-  }, []);
+  const applySnapshot = useCallback(
+    (snap: FinanceSnapshot) => {
+      setIncomes(snap.incomes);
+      setExpenses(snap.expenses);
+      setFixedBills(snap.fixedBills);
+      setDebts(snap.debts);
+      setDebtPayments(snap.debtPayments);
+      setReserves(snap.reserves);
+      setReserveMovements(snap.reserveMovements);
+      setBudgets(snap.budgets);
+      setAuditLogs(snap.auditLogs);
+      if (familyId) {
+        void saveCachedFamilySnapshot(familyId, snap);
+      }
+    },
+    [familyId]
+  );
 
   const fetchSnapshot = useCallback(async () => {
     if (!familyId) return;
@@ -201,15 +212,29 @@ export function FinanceProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
     setLoading(true);
 
+    void loadCachedFamilySnapshot<FinanceSnapshot>(familyId).then((cached) => {
+      if (!cancelled && cached) {
+        setIncomes(cached.incomes || []);
+        setExpenses(cached.expenses || []);
+        setFixedBills(cached.fixedBills || []);
+        setDebts(cached.debts || []);
+        setDebtPayments(cached.debtPayments || []);
+        setReserves(cached.reserves || []);
+        setReserveMovements(cached.reserveMovements || []);
+        setBudgets(cached.budgets || []);
+        setAuditLogs(cached.auditLogs || []);
+      }
+    });
+
     void fetchSnapshot()
       .catch(() => {
-        // handled by AuthContext on 401
+        // offline fallback shows cached snapshot if available
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
 
-    // Real-time synchronization via Server-Sent Events when another family member updates data
+    // Real-time synchronization via SSE when husband or wife updates data
     const unsubEvents = subscribeFamilyEvents((scope) => {
       if (scope === 'family') {
         void refreshSessionState();
@@ -240,10 +265,13 @@ export function FinanceProvider({ children }: { children: React.ReactNode }) {
   };
 
   const updateIncome = async (id: string, input: IncomeInput) => {
-    const snap = await apiRequest<FinanceSnapshot>(`/api/finance/incomes/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: input,
-    });
+    const snap = await apiRequest<FinanceSnapshot>(
+      `/api/finance/incomes/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: input,
+      }
+    );
     applySnapshot(snap);
   };
 
@@ -447,18 +475,14 @@ export function FinanceProvider({ children }: { children: React.ReactNode }) {
   };
 
   // --- BUDGETS ---
-  const saveBudget = async ({
-    category,
-    monthlyLimit,
-    existingId,
-  }: {
+  const saveBudget = async (params: {
     category: string;
     monthlyLimit: number;
     existingId?: string;
   }) => {
     const snap = await apiRequest<FinanceSnapshot>('/api/finance/budgets', {
       method: 'POST',
-      body: { category, monthlyLimit, existingId },
+      body: params,
     });
     applySnapshot(snap);
   };

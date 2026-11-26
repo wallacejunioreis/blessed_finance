@@ -1,4 +1,4 @@
-// Session token is held strictly in JS memory (never in localStorage or sessionStorage)
+// Session token is held in JS memory and persisted encrypted inside IndexedDB (never localStorage/sessionStorage)
 let memoryAuthToken: string | null = null;
 
 export function setMemoryAuthToken(token: string | null) {
@@ -35,12 +35,20 @@ export async function apiRequest<T>(
     headers.Authorization = `Bearer ${memoryAuthToken}`;
   }
 
-  const res = await fetch(path, {
-    method: options.method || 'GET',
-    headers,
-    credentials: 'same-origin',
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: options.method || 'GET',
+      headers,
+      credentials: 'same-origin',
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+  } catch {
+    throw new ApiError(
+      'Sem conexão com o servidor no momento. Verifique sua internet e tente novamente.',
+      0
+    );
+  }
 
   const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   if (!res.ok) {

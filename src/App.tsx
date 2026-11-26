@@ -10,6 +10,7 @@ import {
   LayoutDashboard,
   Lightbulb,
   Menu,
+  PieChart,
   PiggyBank,
   Plus,
   Target,
@@ -29,6 +30,8 @@ import { HistoryView } from './components/HistoryView';
 import { IncomesView } from './components/IncomesView';
 import { IntelligenceView } from './components/IntelligenceView';
 import { PlanningView } from './components/PlanningView';
+import { PowerBIView } from './components/PowerBIView';
+import { OfflineIndicator, PWAInstallButton } from './components/PWAStatusBanner';
 import { QuickTransactionModal } from './components/QuickTransactionModal';
 import { ReportsView } from './components/ReportsView';
 import { ReserveView } from './components/ReserveView';
@@ -53,6 +56,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'planejamento', label: 'Planejamento', shortLabel: 'Planos', icon: Target },
   { id: 'inteligencia', label: 'Inteligência Financeira', shortLabel: 'Dicas', icon: Lightbulb },
   { id: 'relatorios', label: 'Relatórios', shortLabel: 'Relatórios', icon: BarChart3 },
+  { id: 'power_bi', label: 'Power BI Local', shortLabel: 'Power BI', icon: PieChart },
   { id: 'historico', label: 'Histórico', shortLabel: 'Histórico', icon: History },
   { id: 'familia', label: 'Família e Segurança', shortLabel: 'Família', icon: Users },
 ];
@@ -66,8 +70,6 @@ function AppShell() {
     profile,
     profileLoading,
     family,
-    pendingRecoveryCode,
-    dismissRecoveryCode,
   } = useAuth();
 
   const [route, setRoute] = useState<AppRoute>('dashboard');
@@ -77,7 +79,6 @@ function AppShell() {
   });
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [toast, setToast] = useState<string>('');
-  const [copiedRecovery, setCopiedRecovery] = useState(false);
 
   const notify = (msg: string) => {
     setToast(msg);
@@ -105,57 +106,30 @@ function AppShell() {
   }
 
   if (!user) {
-    return <AuthScreen />;
-  }
-
-  if (pendingRecoveryCode) {
     return (
-      <div className="min-h-screen bg-[#F8FAF9] flex items-center justify-center p-6">
-        <div className="max-w-md w-full bg-white border border-slate-200 rounded-xl p-8 space-y-5">
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-[#9A7B2C]">Guarde em local seguro</p>
-            <h1 className="text-xl font-bold text-slate-900">Seu código de recuperação</h1>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              Como todos os dados ficam salvos no banco local do projeto sem serviços externos, use
-              este código caso precise redefinir sua senha no futuro. Ele só é exibido agora.
-            </p>
-          </div>
-
-          <div className="bg-[#F8FAF9] border border-slate-200 rounded-lg p-4 text-center space-y-3">
-            <p className="font-mono text-xl font-bold tracking-wider text-[#0D3B2E]">
-              {pendingRecoveryCode}
-            </p>
-            <button
-              type="button"
-              onClick={() => {
-                navigator.clipboard?.writeText(pendingRecoveryCode);
-                setCopiedRecovery(true);
-                setTimeout(() => setCopiedRecovery(false), 2500);
-              }}
-              className="w-full py-2 px-3 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100 cursor-pointer"
-            >
-              {copiedRecovery ? 'Código copiado!' : 'Copiar código de recuperação'}
-            </button>
-          </div>
-
-          <button
-            type="button"
-            onClick={dismissRecoveryCode}
-            className="w-full py-2.5 px-4 rounded-lg bg-[#0D3B2E] text-white text-sm font-semibold hover:bg-[#14533F] cursor-pointer"
-          >
-            Já anotei, continuar
-          </button>
-        </div>
-      </div>
+      <>
+        <OfflineIndicator />
+        <AuthScreen />
+      </>
     );
   }
 
   if (!profile?.familyId || !family) {
-    return <FamilySetupScreen />;
+    return (
+      <>
+        <OfflineIndicator />
+        <FamilySetupScreen />
+      </>
+    );
   }
 
   if (!profile.onboardingCompleted) {
-    return <FirstAccessWizard />;
+    return (
+      <>
+        <OfflineIndicator />
+        <FirstAccessWizard />
+      </>
+    );
   }
 
   const currentNav = NAV_ITEMS.find((n) => n.id === route) || NAV_ITEMS[0];
@@ -214,6 +188,7 @@ function AppShell() {
 
       {/* Main Column */}
       <div className="flex-1 lg:pl-64 flex flex-col min-w-0 pb-20 lg:pb-8">
+        <OfflineIndicator />
         {/* Top Bar */}
         <header className="sticky top-0 z-20 bg-white/95 backdrop-blur border-b border-slate-200 px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0">
@@ -229,14 +204,17 @@ function AppShell() {
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={() => setQuickModal({ open: true, type: 'despesa' })}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#0D3B2E] text-white text-xs sm:text-sm font-semibold hover:bg-[#14533F] transition-colors cursor-pointer whitespace-nowrap shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            Novo lançamento
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <PWAInstallButton />
+            <button
+              type="button"
+              onClick={() => setQuickModal({ open: true, type: 'despesa' })}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#0D3B2E] text-white text-xs sm:text-sm font-semibold hover:bg-[#14533F] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Plus className="w-4 h-4" />
+              Novo lançamento
+            </button>
+          </div>
         </header>
 
         {/* Main Content Viewport */}
@@ -263,6 +241,7 @@ function AppShell() {
               {route === 'planejamento' && <PlanningView onNotify={notify} />}
               {route === 'inteligencia' && <IntelligenceView />}
               {route === 'relatorios' && <ReportsView />}
+              {route === 'power_bi' && <PowerBIView onNotify={notify} />}
               {route === 'historico' && <HistoryView onNotify={notify} />}
               {route === 'familia' && <FamilySettingsView onNotify={notify} />}
             </motion.div>

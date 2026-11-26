@@ -194,6 +194,7 @@ export type AppRoute =
   | 'planejamento'
   | 'inteligencia'
   | 'relatorios'
+  | 'power_bi'
   | 'historico'
   | 'familia';
 

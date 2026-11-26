@@ -19,6 +19,44 @@ db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA foreign_keys = ON;
 
+  CREATE TABLE IF NOT EXISTS users (
+    uid TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    family_id TEXT,
+    onboarding_completed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    uid TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS recovery_codes (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    token_hash TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS families (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -28,34 +66,11 @@ db.exec(`
     updated_at TEXT NOT NULL
   );
 
-  CREATE TABLE IF NOT EXISTS users (
-    uid TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    recovery_code_hash TEXT NOT NULL,
-    role TEXT NOT NULL,
-    family_id TEXT,
-    onboarding_completed INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE SET NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS sessions (
-    token_hash TEXT PRIMARY KEY,
-    user_uid TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (user_uid) REFERENCES users(uid) ON DELETE CASCADE
-  );
-
   CREATE TABLE IF NOT EXISTS family_members (
     family_id TEXT NOT NULL,
     uid TEXT NOT NULL,
     display_name TEXT NOT NULL,
     role TEXT NOT NULL,
-    invite_code TEXT,
     joined_at TEXT NOT NULL,
     PRIMARY KEY (family_id, uid),
     FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE,
@@ -75,8 +90,7 @@ db.exec(`
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS expenses (
@@ -102,8 +116,7 @@ db.exec(`
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS fixed_bills (
@@ -123,8 +136,7 @@ db.exec(`
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS debts (
@@ -144,8 +156,7 @@ db.exec(`
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS debt_payments (
@@ -159,8 +170,7 @@ db.exec(`
     notes TEXT NOT NULL DEFAULT '',
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    created_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS reserves (
@@ -174,8 +184,7 @@ db.exec(`
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS reserve_movements (
@@ -189,8 +198,7 @@ db.exec(`
     notes TEXT NOT NULL DEFAULT '',
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    created_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS budgets (
@@ -202,8 +210,7 @@ db.exec(`
     created_by_uid TEXT NOT NULL,
     created_by_name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    updated_at TEXT NOT NULL
   );
 
   CREATE TABLE IF NOT EXISTS audit_logs (
@@ -216,11 +223,11 @@ db.exec(`
     amount REAL,
     performed_by_uid TEXT NOT NULL,
     performed_by_name TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    FOREIGN KEY (family_id) REFERENCES families(id) ON DELETE CASCADE
+    created_at TEXT NOT NULL
   );
 
-  CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_uid);
+  CREATE INDEX IF NOT EXISTS idx_sessions_uid ON sessions(uid);
+  CREATE INDEX IF NOT EXISTS idx_recovery_email ON recovery_codes(email, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_incomes_family ON incomes(family_id, date DESC);
   CREATE INDEX IF NOT EXISTS idx_expenses_family ON expenses(family_id, date DESC);
   CREATE INDEX IF NOT EXISTS idx_fixed_bills_family ON fixed_bills(family_id);
@@ -270,36 +277,27 @@ export function verifySecret(secret: string, storedHash: string): boolean {
 }
 
 export function hashToken(token: string): string {
-  return crypto.createHash('sha256').update(token).digest('hex');
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
-export function generateOpaqueToken(): string {
-  return crypto.randomBytes(32).toString('base64url');
+export function generateSessionToken(): string {
+  return crypto.randomBytes(32).toString('hex');
 }
 
-export function generateDocId(prefix: string): string {
-  const rand = crypto.randomBytes(6).toString('hex');
-  const ts = Date.now().toString(36);
-  return `${prefix}_${ts}_${rand}`.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
+export function generateSixDigitCode(): string {
+  return String(crypto.randomInt(100000, 1000000));
 }
 
 export function generateInviteCode(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = crypto.randomBytes(8);
-  let code = '';
+  let out = '';
   for (let i = 0; i < 8; i++) {
-    code += chars[bytes[i] % chars.length];
+    out += chars[bytes[i] % chars.length];
   }
-  return code;
+  return out;
 }
 
-export function generateRecoveryCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const bytes = crypto.randomBytes(10);
-  let code = '';
-  for (let i = 0; i < 10; i++) {
-    if (i === 5) code += '-';
-    code += chars[bytes[i] % chars.length];
-  }
-  return code;
+export function generateId(prefix: string): string {
+  return `${prefix}_${Date.now().toString(36)}_${crypto.randomBytes(6).toString('hex')}`;
 }

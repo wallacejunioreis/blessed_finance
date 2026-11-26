@@ -4,12 +4,13 @@ import type { NextFunction, Request, Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import nodemailer from 'nodemailer';
 import {
   db,
-  generateDocId,
+  generateId,
   generateInviteCode,
-  generateOpaqueToken,
-  generateRecoveryCode,
+  generateSessionToken,
+  generateSixDigitCode,
   hashSecret,
   hashToken,
   runInTransaction,
@@ -22,119 +23,56 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
+
 const SESSION_COOKIE_NAME = 'bf_session';
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_VERIFY_ATTEMPTS = 5;
 
-const VALID_ROLES = new Set(['marido', 'esposa', 'familiar']);
-const VALID_FREQUENCIES = new Set(['mensal', 'bimestral', 'trimestral', 'anual']);
-const VALID_PAYMENT_TYPES = new Set(['parcela', 'parcial', 'quitacao']);
+type Row = Record<string, unknown>;
 
-const MAX_LENGTHS = {
-  displayName: 80,
-  email: 150,
-  familyName: 80,
-  description: 140,
-  category: 60,
-  subcategory: 60,
-  paymentMethod: 40,
-  notes: 500,
-  billName: 100,
-  debtName: 100,
-  creditor: 100,
-  goalName: 100,
-  summary: 240,
-};
-
-interface DbUserRow {
+interface AuthUser {
   uid: string;
-  display_name: string;
+  displayName: string;
   email: string;
-  password_hash: string;
-  recovery_code_hash: string;
   role: 'marido' | 'esposa' | 'familiar';
-  family_id: string | null;
-  onboarding_completed: number;
-  created_at: string;
-  updated_at: string;
+  familyId: string | null;
+  onboardingCompleted: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
-interface DbFamilyRow {
-  id: string;
-  name: string;
-  owner_id: string;
-  invite_code: string;
-  created_at: string;
-  updated_at: string;
+interface RequestWithUser extends Request {
+  authUser?: AuthUser;
+  authTokenHash?: string;
 }
 
-interface AuthedRequest extends Request {
-  authUser?: DbUserRow;
-  sessionTokenHash?: string;
-}
-
-// In-memory SSE subscribers grouped by familyId
-const familyStreams = new Map<string, Set<Response>>();
-
-function broadcastFamilySync(familyId: string | null | undefined, scope = 'all') {
-  if (!familyId) return;
-  const listeners = familyStreams.get(familyId);
-  if (!listeners || listeners.size === 0) return;
-  const payload = `data: ${JSON.stringify({ type: 'sync', scope, ts: Date.now() })}\n\n`;
-  for (const res of listeners) {
-    try {
-      res.write(payload);
-    } catch {
-      listeners.delete(res);
-    }
-  }
-}
+// --- Helpers & Sanitizers ---
 
 function clampText(val: unknown, maxLen: number): string {
   if (typeof val !== 'string') return '';
   return val.trim().slice(0, maxLen);
 }
 
+function clampEmail(val: unknown): string {
+  if (typeof val !== 'string') return '';
+  return val.trim().toLowerCase().slice(0, 150);
+}
+
 function clampAmount(val: unknown): number {
-  const num = typeof val === 'number' ? val : Number(val);
+  const num = Number(val);
   if (!Number.isFinite(num) || num < 0) return 0;
   return Math.min(Math.round(num * 100) / 100, 100_000_000);
 }
 
-function sanitizeDateISO(val: unknown): string | null {
-  if (typeof val !== 'string') return null;
-  const trimmed = val.trim().slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return null;
-  return trimmed;
+function normalizeRole(val: unknown): 'marido' | 'esposa' | 'familiar' {
+  return val === 'marido' || val === 'esposa' || val === 'familiar' ? val : 'familiar';
 }
 
-function sanitizeId(val: unknown): string | null {
-  if (typeof val !== 'string') return null;
-  const trimmed = val.trim();
-  if (!/^[a-zA-Z0-9_-]{3,120}$/.test(trimmed)) return null;
-  return trimmed;
-}
-
-function addMonthsToISO(isoDate: string, monthsToAdd: number): string {
-  const [yStr, mStr, dStr] = isoDate.split('-');
-  const year = parseInt(yStr, 10);
-  const month = parseInt(mStr, 10) - 1;
-  const day = parseInt(dStr, 10);
-  const targetMonthIndex = month + monthsToAdd;
-  const targetYear = year + Math.floor(targetMonthIndex / 12);
-  const normalizedMonth = ((targetMonthIndex % 12) + 12) % 12;
-  const maxDaysInTargetMonth = new Date(targetYear, normalizedMonth + 1, 0).getDate();
-  const safeDay = Math.min(day, maxDaysInTargetMonth);
-  return `${targetYear}-${String(normalizedMonth + 1).padStart(2, '0')}-${String(safeDay).padStart(2, '0')}`;
-}
-
-function formatBRLServer(value: number): string {
-  const safe = Number.isFinite(value) ? value : 0;
-  return new Intl.NumberFormat('pt-BR', {
-    style: 'currency',
-    currency: 'BRL',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(safe);
+function normalizeFrequency(val: unknown): 'mensal' | 'bimestral' | 'trimestral' | 'anual' {
+  return val === 'mensal' || val === 'bimestral' || val === 'trimestral' || val === 'anual'
+    ? val
+    : 'mensal';
 }
 
 function getTodayBrazilISO(): string {
@@ -150,134 +88,214 @@ function getTodayBrazilISO(): string {
   }
 }
 
-function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+function normalizeIsoDate(val: unknown, fallback: string): string {
+  if (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(val.trim())) {
+    return val.trim();
+  }
+  return fallback;
+}
+
+function addMonthsToISO(isoDate: string, monthsToAdd: number): string {
+  const [yStr, mStr, dStr] = isoDate.split('-');
+  const year = parseInt(yStr, 10);
+  const month = parseInt(mStr, 10) - 1;
+  const day = parseInt(dStr, 10);
+  const targetIdx = month + monthsToAdd;
+  const targetYear = year + Math.floor(targetIdx / 12);
+  const normMonth = ((targetIdx % 12) + 12) % 12;
+  const maxDay = new Date(targetYear, normMonth + 1, 0).getDate();
+  const safeDay = Math.min(day, maxDay);
+  return `${targetYear}-${String(normMonth + 1).padStart(2, '0')}-${String(safeDay).padStart(2, '0')}`;
+}
+
+function parseCookies(header: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
-  if (!cookieHeader) return out;
-  for (const part of cookieHeader.split(';')) {
+  if (!header) return out;
+  for (const part of header.split(';')) {
     const idx = part.indexOf('=');
-    if (idx <= 0) continue;
+    if (idx === -1) continue;
     const key = part.slice(0, idx).trim();
     const val = part.slice(idx + 1).trim();
-    if (key) {
-      try {
-        out[key] = decodeURIComponent(val);
-      } catch {
-        out[key] = val;
-      }
-    }
+    if (key) out[key] = decodeURIComponent(val);
   }
   return out;
 }
 
 function isHttpsRequest(req: Request): boolean {
   const proto = req.headers['x-forwarded-proto'];
-  if (typeof proto === 'string' && proto.split(',')[0].trim() === 'https') return true;
-  return req.secure;
+  return req.secure || (typeof proto === 'string' && proto.split(',')[0].trim() === 'https');
 }
 
-function setSessionCookie(req: Request, res: Response, rawToken: string) {
+function setSessionCookie(req: Request, res: Response, token: string) {
   const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
   const https = isHttpsRequest(req);
-  const parts = [
-    `${SESSION_COOKIE_NAME}=${encodeURIComponent(rawToken)}`,
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
     'Path=/',
-    `Max-Age=${maxAgeSec}`,
     'HttpOnly',
+    `Max-Age=${maxAgeSec}`,
+    https ? 'SameSite=None; Secure' : 'SameSite=Lax',
   ];
-  if (https) {
-    parts.push('Secure', 'SameSite=None', 'Partitioned');
-  } else {
-    parts.push('SameSite=Lax');
-  }
-  res.setHeader('Set-Cookie', parts.join('; '));
+  res.setHeader('Set-Cookie', attrs.join('; '));
 }
 
 function clearSessionCookie(req: Request, res: Response) {
   const https = isHttpsRequest(req);
-  const parts = [`${SESSION_COOKIE_NAME}=`, 'Path=/', 'Max-Age=0', 'HttpOnly'];
-  if (https) {
-    parts.push('Secure', 'SameSite=None', 'Partitioned');
-  } else {
-    parts.push('SameSite=Lax');
-  }
-  res.setHeader('Set-Cookie', parts.join('; '));
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=0',
+    https ? 'SameSite=None; Secure' : 'SameSite=Lax',
+  ];
+  res.setHeader('Set-Cookie', attrs.join('; '));
 }
 
-function extractSessionToken(req: Request): { token: string | null; viaCookie: boolean } {
-  const authHeader = req.headers.authorization;
-  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    if (token.length >= 16) return { token, viaCookie: false };
-  }
-  const cookies = parseCookies(req.headers.cookie);
-  const cookieToken = cookies[SESSION_COOKIE_NAME];
-  if (cookieToken && cookieToken.length >= 16) {
-    return { token: cookieToken, viaCookie: true };
-  }
-  return { token: null, viaCookie: false };
-}
-
-function createSessionForUser(userUid: string): string {
-  const rawToken = generateOpaqueToken();
-  const tokenHash = hashToken(rawToken);
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
-  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now.toISOString());
-  db.prepare(
-    'INSERT INTO sessions (token_hash, user_uid, expires_at, created_at) VALUES (?, ?, ?, ?)'
-  ).run(tokenHash, userUid, expiresAt, now.toISOString());
-  return rawToken;
-}
-
-function serializeUser(row: DbUserRow) {
+function mapUserRow(row: Row): AuthUser {
   return {
-    uid: row.uid,
-    displayName: row.display_name,
-    email: row.email,
-    role: row.role,
-    familyId: row.family_id,
-    onboardingCompleted: Boolean(row.onboarding_completed),
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    uid: String(row.uid),
+    displayName: String(row.display_name),
+    email: String(row.email),
+    role: normalizeRole(row.role),
+    familyId: row.family_id ? String(row.family_id) : null,
+    onboardingCompleted: Number(row.onboarding_completed) === 1,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
   };
 }
 
-function getFamilyAndMembers(familyId: string | null) {
-  if (!familyId) return { family: null, members: [] };
-  const famRow = db
-    .prepare('SELECT id, name, owner_id, invite_code, created_at, updated_at FROM families WHERE id = ?')
-    .get(familyId) as DbFamilyRow | undefined;
-  if (!famRow) return { family: null, members: [] };
+function getFamilyBundle(user: AuthUser) {
+  if (!user.familyId) {
+    return { user, family: null, members: [] };
+  }
+  const memberCheck = db
+    .prepare('SELECT 1 AS ok FROM family_members WHERE family_id = ? AND uid = ?')
+    .get(user.familyId, user.uid);
+  if (!memberCheck) {
+    return { user: { ...user, familyId: null }, family: null, members: [] };
+  }
+  const fam = db.prepare('SELECT * FROM families WHERE id = ?').get(user.familyId) as
+    | Row
+    | undefined;
+  if (!fam) {
+    return { user: { ...user, familyId: null }, family: null, members: [] };
+  }
+
+  const family = {
+    id: String(fam.id),
+    name: String(fam.name),
+    ownerId: String(fam.owner_id),
+    inviteCode: String(fam.invite_code),
+    createdAt: String(fam.created_at),
+    updatedAt: String(fam.updated_at),
+  };
 
   const memberRows = db
     .prepare(
-      'SELECT uid, display_name, role, invite_code, joined_at FROM family_members WHERE family_id = ? ORDER BY joined_at ASC'
+      'SELECT uid, display_name, role, joined_at FROM family_members WHERE family_id = ? ORDER BY joined_at ASC'
     )
-    .all(familyId) as Array<{
-    uid: string;
-    display_name: string;
-    role: 'marido' | 'esposa' | 'familiar';
-    invite_code: string | null;
-    joined_at: string;
-  }>;
+    .all(family.id) as Row[];
 
-  return {
-    family: {
-      id: famRow.id,
-      name: famRow.name,
-      ownerId: famRow.owner_id,
-      inviteCode: famRow.invite_code,
-      createdAt: famRow.created_at,
-      updatedAt: famRow.updated_at,
-    },
-    members: memberRows.map((m) => ({
-      uid: m.uid,
-      displayName: m.display_name,
-      role: m.role,
-      inviteCode: m.invite_code || undefined,
-      joinedAt: m.joined_at,
-    })),
-  };
+  const members = memberRows.map((m) => ({
+    uid: String(m.uid),
+    displayName: String(m.display_name),
+    role: normalizeRole(m.role),
+    inviteCode: family.inviteCode,
+    joinedAt: String(m.joined_at),
+  }));
+
+  return { user, family, members };
+}
+
+function createSessionForUser(uid: string): string {
+  const token = generateSessionToken();
+  const tokenHash = hashToken(token);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_MS).toISOString();
+
+  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now.toISOString());
+  db.prepare(
+    'INSERT INTO sessions (token_hash, uid, expires_at, created_at) VALUES (?, ?, ?, ?)'
+  ).run(tokenHash, uid, expiresAt, now.toISOString());
+
+  return token;
+}
+
+function extractRequestToken(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) return bearer;
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[SESSION_COOKIE_NAME] || null;
+}
+
+function resolveSession(req: Request): { user: AuthUser; tokenHash: string } | null {
+  const token = extractRequestToken(req);
+  if (!token) return null;
+  const tokenHash = hashToken(token);
+  const sess = db
+    .prepare('SELECT uid, expires_at FROM sessions WHERE token_hash = ?')
+    .get(tokenHash) as Row | undefined;
+  if (!sess) return null;
+  if (new Date(String(sess.expires_at)).getTime() <= Date.now()) {
+    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+    return null;
+  }
+  const userRow = db.prepare('SELECT * FROM users WHERE uid = ?').get(String(sess.uid)) as
+    | Row
+    | undefined;
+  if (!userRow) return null;
+  return { user: mapUserRow(userRow), tokenHash };
+}
+
+function requireAuth(req: RequestWithUser, res: Response, next: NextFunction) {
+  const resolved = resolveSession(req);
+  if (!resolved) {
+    res.status(401).json({ error: 'Sessão expirada ou não autenticada.' });
+    return;
+  }
+  req.authUser = resolved.user;
+  req.authTokenHash = resolved.tokenHash;
+  next();
+}
+
+function requireFamily(req: RequestWithUser, res: Response): { user: AuthUser; familyId: string } | null {
+  const user = req.authUser;
+  if (!user) {
+    res.status(401).json({ error: 'Sessão inválida.' });
+    return null;
+  }
+  if (!user.familyId) {
+    res.status(400).json({ error: 'Crie ou entre em uma família antes de registrar lançamentos.' });
+    return null;
+  }
+  const member = db
+    .prepare('SELECT 1 AS ok FROM family_members WHERE family_id = ? AND uid = ?')
+    .get(user.familyId, user.uid);
+  if (!member) {
+    res.status(403).json({ error: 'Acesso negado aos dados desta família.' });
+    return null;
+  }
+  return { user, familyId: user.familyId };
+}
+
+// --- SSE Real-Time Sync Between Family Devices ---
+
+const sseClients = new Map<string, Set<Response>>();
+
+function broadcastFamilySync(familyId: string, scope: 'finance' | 'family') {
+  const set = sseClients.get(familyId);
+  if (!set || set.size === 0) return;
+  const payload = `data: ${JSON.stringify({ type: 'sync', scope })}\n\n`;
+  for (const res of set) {
+    try {
+      res.write(payload);
+    } catch {
+      // client disconnected
+    }
+  }
 }
 
 function insertAuditLog(params: {
@@ -287,210 +305,194 @@ function insertAuditLog(params: {
   entityId: string;
   summary: string;
   amount?: number;
-  user: DbUserRow;
+  user: AuthUser;
 }) {
-  const id = generateDocId('log');
-  const now = new Date().toISOString();
-  const safeAmount =
-    typeof params.amount === 'number' && Number.isFinite(params.amount) && params.amount >= 0
-      ? clampAmount(params.amount)
-      : null;
-
   db.prepare(
     `INSERT INTO audit_logs (
       id, family_id, action, entity_type, entity_id, summary, amount, performed_by_uid, performed_by_name, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
-    id,
+    generateId('log'),
     params.familyId,
     params.action,
-    clampText(params.entityType, 40),
-    clampText(params.entityId, 128),
-    clampText(params.summary, MAX_LENGTHS.summary),
-    safeAmount,
+    params.entityType,
+    params.entityId,
+    clampText(params.summary, 240),
+    params.amount !== undefined ? clampAmount(params.amount) : null,
     params.user.uid,
-    clampText(params.user.display_name, MAX_LENGTHS.displayName),
-    now
+    params.user.displayName,
+    new Date().toISOString()
   );
 }
 
-function getFinanceSnapshot(familyId: string) {
+function getFamilySnapshot(familyId: string) {
   const incomes = (
     db
       .prepare('SELECT * FROM incomes WHERE family_id = ? ORDER BY date DESC, created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+      .all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    description: r.description,
+    id: String(r.id),
+    description: String(r.description),
     amount: Number(r.amount),
-    date: r.date,
-    category: r.category,
-    responsibleName: r.responsible_name,
-    responsibleUid: r.responsible_uid || undefined,
-    notes: r.notes || '',
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    date: String(r.date),
+    category: String(r.category),
+    responsibleName: String(r.responsible_name),
+    responsibleUid: r.responsible_uid ? String(r.responsible_uid) : undefined,
+    notes: r.notes ? String(r.notes) : '',
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   }));
 
   const expenses = (
     db
       .prepare('SELECT * FROM expenses WHERE family_id = ? ORDER BY date DESC, created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+      .all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    description: r.description,
-    category: r.category,
-    subcategory: r.subcategory,
+    id: String(r.id),
+    description: String(r.description),
+    category: String(r.category),
+    subcategory: String(r.subcategory),
     amount: Number(r.amount),
-    date: r.date,
-    paymentMethod: r.payment_method,
-    responsibleName: r.responsible_name,
-    responsibleUid: r.responsible_uid || undefined,
-    notes: r.notes || '',
-    status: r.status,
-    isInstallment: Boolean(r.is_installment),
-    installmentGroupId: r.installment_group_id || undefined,
-    installmentNumber: r.installment_number ?? undefined,
-    totalInstallments: r.total_installments ?? undefined,
-    isRecurring: Boolean(r.is_recurring),
-    fixedBillId: r.fixed_bill_id || undefined,
-    referenceMonth: r.reference_month || undefined,
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    date: String(r.date),
+    paymentMethod: String(r.payment_method),
+    responsibleName: String(r.responsible_name),
+    responsibleUid: r.responsible_uid ? String(r.responsible_uid) : undefined,
+    notes: r.notes ? String(r.notes) : '',
+    status: r.status === 'pendente' ? 'pendente' : 'pago',
+    isInstallment: Number(r.is_installment) === 1,
+    installmentGroupId: r.installment_group_id ? String(r.installment_group_id) : undefined,
+    installmentNumber: r.installment_number != null ? Number(r.installment_number) : undefined,
+    totalInstallments: r.total_installments != null ? Number(r.total_installments) : undefined,
+    isRecurring: Number(r.is_recurring) === 1,
+    fixedBillId: r.fixed_bill_id ? String(r.fixed_bill_id) : undefined,
+    referenceMonth: r.reference_month ? String(r.reference_month) : undefined,
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   }));
 
   const fixedBills = (
-    db
-      .prepare('SELECT * FROM fixed_bills WHERE family_id = ? ORDER BY created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+    db.prepare('SELECT * FROM fixed_bills WHERE family_id = ? ORDER BY due_day ASC').all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    name: r.name,
+    id: String(r.id),
+    name: String(r.name),
     expectedAmount: Number(r.expected_amount),
     dueDay: Number(r.due_day),
-    frequency: r.frequency,
-    category: r.category,
-    subcategory: r.subcategory,
-    lastPaidMonth: r.last_paid_month || '',
-    lastPaidDate: r.last_paid_date || '',
+    frequency: normalizeFrequency(r.frequency),
+    category: String(r.category),
+    subcategory: String(r.subcategory),
+    lastPaidMonth: String(r.last_paid_month || ''),
+    lastPaidDate: String(r.last_paid_date || ''),
     lastPaidAmount: Number(r.last_paid_amount || 0),
-    active: Boolean(r.active),
-    notes: r.notes || '',
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    active: Number(r.active) === 1,
+    notes: r.notes ? String(r.notes) : '',
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   }));
 
   const debts = (
-    db
-      .prepare('SELECT * FROM debts WHERE family_id = ? ORDER BY created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+    db.prepare('SELECT * FROM debts WHERE family_id = ? ORDER BY created_at DESC').all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    name: r.name,
-    creditor: r.creditor,
+    id: String(r.id),
+    name: String(r.name),
+    creditor: String(r.creditor),
     originalAmount: Number(r.original_amount),
     currentAmount: Number(r.current_amount),
     installmentAmount: Number(r.installment_amount),
     totalInstallments: Number(r.total_installments),
     paidInstallments: Number(r.paid_installments),
     interestRate: Number(r.interest_rate || 0),
-    dueDate: r.due_date,
-    status: r.status,
-    notes: r.notes || '',
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    dueDate: String(r.due_date),
+    status: r.status === 'quitada' ? 'quitada' : 'ativa',
+    notes: r.notes ? String(r.notes) : '',
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   }));
 
   const debtPayments = (
     db
       .prepare('SELECT * FROM debt_payments WHERE family_id = ? ORDER BY date DESC, created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+      .all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    debtId: r.debt_id,
-    debtName: r.debt_name,
+    id: String(r.id),
+    debtId: String(r.debt_id),
+    debtName: String(r.debt_name),
     amount: Number(r.amount),
-    date: r.date,
-    paymentType: r.payment_type,
-    notes: r.notes || '',
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
+    date: String(r.date),
+    paymentType:
+      r.payment_type === 'parcial' || r.payment_type === 'quitacao' ? r.payment_type : 'parcela',
+    notes: r.notes ? String(r.notes) : '',
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
   }));
 
   const reserves = (
-    db
-      .prepare('SELECT * FROM reserves WHERE family_id = ? ORDER BY created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+    db.prepare('SELECT * FROM reserves WHERE family_id = ? ORDER BY created_at DESC').all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    name: r.name,
+    id: String(r.id),
+    name: String(r.name),
     targetAmount: Number(r.target_amount),
     currentAmount: Number(r.current_amount),
-    monthlyContribution: Number(r.monthly_contribution || 0),
-    notes: r.notes || '',
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    monthlyContribution: Number(r.monthly_contribution),
+    notes: r.notes ? String(r.notes) : '',
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   }));
 
   const reserveMovements = (
     db
-      .prepare(
-        'SELECT * FROM reserve_movements WHERE family_id = ? ORDER BY date DESC, created_at DESC'
-      )
-      .all(familyId) as Array<Record<string, unknown>>
+      .prepare('SELECT * FROM reserve_movements WHERE family_id = ? ORDER BY date DESC, created_at DESC')
+      .all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    goalId: r.goal_id,
-    goalName: r.goal_name,
-    type: r.type,
+    id: String(r.id),
+    goalId: String(r.goal_id),
+    goalName: String(r.goal_name),
+    type: r.type === 'retirada' ? 'retirada' : 'deposito',
     amount: Number(r.amount),
-    date: r.date,
-    notes: r.notes || '',
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
+    date: String(r.date),
+    notes: r.notes ? String(r.notes) : '',
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
   }));
 
   const budgets = (
-    db
-      .prepare('SELECT * FROM budgets WHERE family_id = ? ORDER BY created_at DESC')
-      .all(familyId) as Array<Record<string, unknown>>
+    db.prepare('SELECT * FROM budgets WHERE family_id = ? ORDER BY category ASC').all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    category: r.category,
+    id: String(r.id),
+    category: String(r.category),
     monthlyLimit: Number(r.monthly_limit),
-    month: r.month,
-    createdByUid: r.created_by_uid,
-    createdByName: r.created_by_name,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
+    month: String(r.month),
+    createdByUid: String(r.created_by_uid),
+    createdByName: String(r.created_by_name),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   }));
 
   const auditLogs = (
     db
-      .prepare('SELECT * FROM audit_logs WHERE family_id = ? ORDER BY created_at DESC LIMIT 250')
-      .all(familyId) as Array<Record<string, unknown>>
+      .prepare('SELECT * FROM audit_logs WHERE family_id = ? ORDER BY created_at DESC LIMIT 200')
+      .all(familyId) as Row[]
   ).map((r) => ({
-    id: r.id,
-    action: r.action,
-    entityType: r.entity_type,
-    entityId: r.entity_id,
-    summary: r.summary,
-    amount: r.amount !== null && r.amount !== undefined ? Number(r.amount) : undefined,
-    performedByUid: r.performed_by_uid,
-    performedByName: r.performed_by_name,
-    createdAt: r.created_at,
+    id: String(r.id),
+    action: String(r.action),
+    entityType: String(r.entity_type),
+    entityId: String(r.entity_id),
+    summary: String(r.summary),
+    amount: r.amount != null ? Number(r.amount) : undefined,
+    performedByUid: String(r.performed_by_uid),
+    performedByName: String(r.performed_by_name),
+    createdAt: String(r.created_at),
   }));
 
   return {
@@ -506,12 +508,104 @@ function getFinanceSnapshot(familyId: string) {
   };
 }
 
+// --- Email Recovery Dispatcher ---
+
+async function sendRecoveryCodeEmail(toEmail: string, code: string): Promise<void> {
+  const fromAddress = (process.env.EMAIL_FROM || process.env.SMTP_USER || '').trim();
+  const resendKey = (process.env.RESEND_API_KEY || '').trim();
+  const smtpHost = (process.env.SMTP_HOST || '').trim();
+
+  const subject = 'Blessed Finance — Código de recuperação de senha';
+  const textBody = [
+    'Olá!',
+    '',
+    'Recebemos uma solicitação para redefinir a senha da sua conta no Blessed Finance.',
+    `Seu código de verificação de 6 dígitos é: ${code}`,
+    '',
+    'Este código expira em 10 minutos e só pode ser utilizado uma única vez.',
+    'Se você não solicitou esta alteração, ignore este e-mail.',
+  ].join('\n');
+
+  const htmlBody = `
+    <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
+      <h2 style="margin: 0 0 12px; color: #0D3B2E;">Blessed Finance</h2>
+      <p style="color: #334155; font-size: 14px; line-height: 1.5;">
+        Recebemos uma solicitação para redefinir a senha da sua conta familiar.
+      </p>
+      <div style="margin: 20px 0; padding: 16px; background: #F8FAF9; border: 1px solid #cbd5e1; border-radius: 8px; text-align: center;">
+        <span style="font-size: 12px; color: #64748b; display: block; margin-bottom: 6px;">Seu código de verificação</span>
+        <strong style="font-size: 28px; letter-spacing: 6px; color: #0D3B2E; font-family: monospace;">${code}</strong>
+      </div>
+      <p style="color: #475569; font-size: 12px; line-height: 1.5;">
+        Este código é válido por <strong>10 minutos</strong> e pode ser usado apenas <strong>uma vez</strong>.
+      </p>
+    </div>
+  `;
+
+  if (resendKey) {
+    const sender = fromAddress || 'Blessed Finance <onboarding@resend.dev>';
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${resendKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: sender,
+        to: [toEmail],
+        subject,
+        text: textBody,
+        html: htmlBody,
+      }),
+    });
+    if (!resp.ok) {
+      throw new Error('Falha ao enviar o e-mail de recuperação pelo provedor.');
+    }
+    return;
+  }
+
+  if (smtpHost) {
+    const port = Number(process.env.SMTP_PORT || 587);
+    const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+    const smtpUser = (process.env.SMTP_USER || '').trim();
+    const smtpPass = (process.env.SMTP_PASS || '').trim();
+
+    const transporter = nodemailer.createTransport({
+      host: smtpHost,
+      port: Number.isFinite(port) ? port : 587,
+      secure,
+      auth: smtpUser ? { user: smtpUser, pass: smtpPass } : undefined,
+      tls:
+        smtpHost === '127.0.0.1' || smtpHost === 'localhost'
+          ? { rejectUnauthorized: false }
+          : undefined,
+    });
+
+    await transporter.sendMail({
+      from: fromAddress || smtpUser || 'no-reply@blessedfinance.local',
+      to: toEmail,
+      subject,
+      text: textBody,
+      html: htmlBody,
+    });
+    return;
+  }
+
+  throw Object.assign(
+    new Error(
+      'Serviço de envio de e-mail não configurado no servidor. Configure SMTP_HOST/SMTP_USER/SMTP_PASS ou RESEND_API_KEY nas variáveis de ambiente.'
+    ),
+    { statusCode: 503 }
+  );
+}
+
+// --- Express App Setup ---
+
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(express.json({ limit: '2mb' }));
 
-// HTTPS redirect in production behind proxy
 app.use((req: Request, res: Response, next: NextFunction) => {
   const proto = req.headers['x-forwarded-proto'];
   if (IS_PROD && typeof proto === 'string' && proto !== 'https') {
@@ -524,7 +618,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Strict HTTP Security Headers & Content Security Policy (self-contained local app)
 app.use((_req: Request, res: Response, next: NextFunction) => {
   const cspDirectives = [
     "default-src 'self'",
@@ -533,6 +626,8 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
     "font-src 'self' https://fonts.gstatic.com data:",
     "img-src 'self' data: blob:",
     "connect-src 'self'",
+    "worker-src 'self'",
+    "manifest-src 'self'",
     "frame-src 'self'",
     "object-src 'none'",
     "base-uri 'self'",
@@ -553,9 +648,8 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Sliding-window rate limiters
-const generalBuckets = new Map<string, { count: number; resetAt: number }>();
 const authBuckets = new Map<string, { count: number; resetAt: number }>();
+const recoveryBuckets = new Map<string, { count: number; resetAt: number }>();
 
 function createRateLimiter(
   buckets: Map<string, { count: number; resetAt: number }>,
@@ -575,7 +669,7 @@ function createRateLimiter(
     if (bucket.count > maxReq) {
       res.setHeader('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
       res.status(429).json({
-        error: 'Muitas tentativas em sequência. Aguarde um minuto e tente novamente.',
+        error: 'Muitas tentativas em sequência. Aguarde alguns minutos e tente novamente.',
       });
       return;
     }
@@ -583,22 +677,24 @@ function createRateLimiter(
   };
 }
 
-const apiRateLimiter = createRateLimiter(generalBuckets, 60_000, 180);
-const authRateLimiter = createRateLimiter(authBuckets, 60_000, 20);
+const authLimiter = createRateLimiter(authBuckets, 15 * 60_000, 30);
+const recoveryLimiter = createRateLimiter(recoveryBuckets, 15 * 60_000, 12);
 
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of generalBuckets.entries()) if (now > v.resetAt) generalBuckets.delete(k);
-  for (const [k, v] of authBuckets.entries()) if (now > v.resetAt) authBuckets.delete(k);
+  for (const [k, v] of authBuckets.entries()) {
+    if (now > v.resetAt) authBuckets.delete(k);
+  }
+  for (const [k, v] of recoveryBuckets.entries()) {
+    if (now > v.resetAt) recoveryBuckets.delete(k);
+  }
 }, 5 * 60_000).unref();
 
-// Origin & CSRF header verification for state-changing API routes
 function verifyRequestOrigin(req: Request, res: Response, next: NextFunction) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     next();
     return;
   }
-
   const origin = req.headers.origin;
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   const allowedEnv = (process.env.ALLOWED_ORIGINS || '')
@@ -620,279 +716,341 @@ function verifyRequestOrigin(req: Request, res: Response, next: NextFunction) {
       return;
     }
   }
-
-  // Require custom header on cookie-authenticated mutations when Authorization Bearer is not present
-  const authHeader = req.headers.authorization;
-  const cookies = parseCookies(req.headers.cookie);
-  if (!authHeader && cookies[SESSION_COOKIE_NAME] && req.headers['x-requested-with'] !== 'BlessedFinance') {
-    res.status(403).json({ error: 'Cabeçalho de segurança ausente.' });
-    return;
-  }
-
   next();
 }
 
-function resolveSessionUser(req: AuthedRequest): { user: DbUserRow; tokenHash: string } | null {
-  const { token } = extractSessionToken(req);
-  if (!token) return null;
-  const tokenHash = hashToken(token);
-  const row = db
-    .prepare(
-      `SELECT u.*, s.expires_at
-       FROM sessions s
-       JOIN users u ON u.uid = s.user_uid
-       WHERE s.token_hash = ?`
-    )
-    .get(tokenHash) as (DbUserRow & { expires_at: string }) | undefined;
-
-  if (!row) return null;
-  if (new Date(row.expires_at).getTime() <= Date.now()) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
-    return null;
-  }
-  return { user: row, tokenHash };
-}
-
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
-  const resolved = resolveSessionUser(req);
-  if (!resolved) {
-    res.status(401).json({ error: 'Sessão inválida ou expirada. Faça login novamente.' });
-    return;
-  }
-  req.authUser = resolved.user;
-  req.sessionTokenHash = resolved.tokenHash;
-  next();
-}
-
-function requireFamily(req: AuthedRequest, res: Response, next: NextFunction) {
-  if (!req.authUser?.family_id) {
-    res.status(403).json({ error: 'Você ainda não pertence a uma família conectada.' });
-    return;
-  }
-  const member = db
-    .prepare('SELECT 1 FROM family_members WHERE family_id = ? AND uid = ?')
-    .get(req.authUser.family_id, req.authUser.uid);
-  if (!member) {
-    res.status(403).json({ error: 'Acesso revogado para esta família.' });
-    return;
-  }
-  next();
-}
-
-app.use('/api', apiRateLimiter, verifyRequestOrigin);
+app.use('/api', verifyRequestOrigin);
 
 app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({ ok: true, service: 'Blessed Finance', storage: 'local-sqlite' });
+  res.json({
+    ok: true,
+    service: 'Blessed Finance',
+    storage: 'builtin-sqlite',
+  });
 });
 
-// --- AUTH ROUTES ---
-app.get('/api/auth/me', (req: AuthedRequest, res: Response) => {
-  const resolved = resolveSessionUser(req);
+// --- Auth Routes ---
+
+app.get('/api/auth/me', (req: Request, res: Response) => {
+  const resolved = resolveSession(req);
   if (!resolved) {
     res.json({ user: null, family: null, members: [] });
     return;
   }
-  const { family, members } = getFamilyAndMembers(resolved.user.family_id);
-  res.json({
-    user: serializeUser(resolved.user),
-    family,
-    members,
-  });
+  res.json(getFamilyBundle(resolved.user));
 });
 
-app.post('/api/auth/register', authRateLimiter, (req: Request, res: Response) => {
-  const body = req.body as Record<string, unknown>;
-  const name = clampText(body.name, MAX_LENGTHS.displayName);
-  const email = clampText(body.email, MAX_LENGTHS.email).toLowerCase();
+app.post('/api/auth/register', authLimiter, (req: Request, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 80);
+  const email = clampEmail(body.email);
   const password = typeof body.password === 'string' ? body.password : '';
-  const role = typeof body.role === 'string' && VALID_ROLES.has(body.role) ? body.role : 'marido';
+  const role = normalizeRole(body.role);
 
-  if (!name) {
-    res.status(400).json({ error: 'Informe seu nome para continuar.' });
+  if (!name || name.length < 2) {
+    res.status(400).json({ error: 'Informe seu nome completo para criar a conta.' });
     return;
   }
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     res.status(400).json({ error: 'Informe um endereço de e-mail válido.' });
     return;
   }
   if (password.length < 6) {
-    res.status(400).json({ error: 'A senha deve ter pelo menos 6 caracteres.' });
+    res.status(400).json({ error: 'A senha deve ter no mínimo 6 caracteres.' });
     return;
   }
 
   const existing = db.prepare('SELECT uid FROM users WHERE email = ?').get(email);
   if (existing) {
-    res.status(409).json({ error: 'Não foi possível concluir o cadastro com este e-mail.' });
+    res.status(409).json({ error: 'Já existe uma conta cadastrada com este e-mail.' });
     return;
   }
 
-  const uid = generateDocId('usr');
+  const uid = generateId('usr');
   const now = new Date().toISOString();
   const passwordHash = hashSecret(password);
-  const recoveryCode = generateRecoveryCode();
-  const recoveryCodeHash = hashSecret(recoveryCode.replace(/[^A-Z0-9]/g, '').toUpperCase());
 
-  db.prepare(
-    `INSERT INTO users (
-      uid, display_name, email, password_hash, recovery_code_hash, role, family_id, onboarding_completed, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)`
-  ).run(uid, name, email, passwordHash, recoveryCodeHash, role, now, now);
-
-  const userRow = db.prepare('SELECT * FROM users WHERE uid = ?').get(uid) as unknown as DbUserRow;
-  const rawToken = createSessionForUser(uid);
-  setSessionCookie(req, res, rawToken);
-
-  res.status(201).json({
-    user: serializeUser(userRow),
-    family: null,
-    members: [],
-    token: rawToken,
-    recoveryCode,
+  runInTransaction(() => {
+    db.prepare(
+      `INSERT INTO users (uid, display_name, email, password_hash, role, family_id, onboarding_completed, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)`
+    ).run(uid, name, email, passwordHash, role, now, now);
   });
+
+  const token = createSessionForUser(uid);
+  setSessionCookie(req, res, token);
+
+  const userRow = db.prepare('SELECT * FROM users WHERE uid = ?').get(uid) as Row;
+  const bundle = getFamilyBundle(mapUserRow(userRow));
+  res.status(201).json({ ...bundle, token });
 });
 
-app.post('/api/auth/login', authRateLimiter, (req: Request, res: Response) => {
-  const body = req.body as Record<string, unknown>;
-  const email = clampText(body.email, MAX_LENGTHS.email).toLowerCase();
+app.post('/api/auth/login', authLimiter, (req: Request, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const email = clampEmail(body.email);
   const password = typeof body.password === 'string' ? body.password : '';
 
   if (!email || !password) {
-    res.status(400).json({ error: 'Informe e-mail e senha.' });
+    res.status(400).json({ error: 'Informe seu e-mail e sua senha.' });
     return;
   }
 
-  const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as
-    | DbUserRow
-    | undefined;
-  if (!userRow || !verifySecret(password, userRow.password_hash)) {
-    res.status(401).json({ error: 'Credenciais inválidas. Confira os dados e tente novamente.' });
+  const row = db
+    .prepare('SELECT * FROM users WHERE email = ?')
+    .get(email) as (Row & { password_hash: string }) | undefined;
+
+  if (!row || !verifySecret(password, String(row.password_hash))) {
+    res.status(401).json({ error: 'E-mail ou senha incorretos.' });
     return;
   }
 
-  const rawToken = createSessionForUser(userRow.uid);
-  setSessionCookie(req, res, rawToken);
-  const { family, members } = getFamilyAndMembers(userRow.family_id);
+  const token = createSessionForUser(String(row.uid));
+  setSessionCookie(req, res, token);
 
-  res.json({
-    user: serializeUser(userRow),
-    family,
-    members,
-    token: rawToken,
-  });
+  const bundle = getFamilyBundle(mapUserRow(row));
+  res.json({ ...bundle, token });
 });
 
-app.post('/api/auth/reset-password', authRateLimiter, (req: Request, res: Response) => {
-  const body = req.body as Record<string, unknown>;
-  const email = clampText(body.email, MAX_LENGTHS.email).toLowerCase();
-  const recoveryCode =
-    typeof body.recoveryCode === 'string'
-      ? body.recoveryCode.toUpperCase().replace(/[^A-Z0-9]/g, '')
-      : '';
-  const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
-
-  if (!email || !recoveryCode || newPassword.length < 6) {
-    res.status(400).json({
-      error: 'Informe e-mail, código de recuperação e uma nova senha com pelo menos 6 caracteres.',
-    });
-    return;
-  }
-
-  const userRow = db.prepare('SELECT * FROM users WHERE email = ?').get(email) as
-    | DbUserRow
-    | undefined;
-  if (!userRow || !verifySecret(recoveryCode, userRow.recovery_code_hash)) {
-    res.status(401).json({ error: 'Dados de recuperação inválidos. Verifique e tente novamente.' });
-    return;
-  }
-
-  const now = new Date().toISOString();
-  const newHash = hashSecret(newPassword);
-  runInTransaction(() => {
-    db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE uid = ?').run(
-      newHash,
-      now,
-      userRow.uid
-    );
-    db.prepare('DELETE FROM sessions WHERE user_uid = ?').run(userRow.uid);
-  });
-
-  res.json({ ok: true });
-});
-
-app.post('/api/auth/logout', (req: AuthedRequest, res: Response) => {
-  const resolved = resolveSessionUser(req);
-  if (resolved) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(resolved.tokenHash);
+app.post('/api/auth/logout', (req: Request, res: Response) => {
+  const token = extractRequestToken(req);
+  if (token) {
+    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
   }
   clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 
-app.post('/api/auth/reauthenticate', requireAuth, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const body = req.body as Record<string, unknown>;
+app.post('/api/auth/reauthenticate', requireAuth, (req: RequestWithUser, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
   const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
-  if (!currentPassword || !verifySecret(currentPassword, user.password_hash)) {
-    res.status(401).json({ error: 'Senha atual incorreta. Verifique e tente novamente.' });
+  const row = db
+    .prepare('SELECT password_hash FROM users WHERE uid = ?')
+    .get(req.authUser!.uid) as Row | undefined;
+  if (!row || !verifySecret(currentPassword, String(row.password_hash))) {
+    res.status(401).json({ error: 'Senha atual incorreta.' });
     return;
   }
   res.json({ ok: true });
 });
 
-app.post('/api/auth/change-password', requireAuth, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const body = req.body as Record<string, unknown>;
+app.post('/api/auth/change-password', requireAuth, (req: RequestWithUser, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
   const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
   const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
-
-  if (!currentPassword || !verifySecret(currentPassword, user.password_hash)) {
-    res.status(401).json({ error: 'Senha atual incorreta.' });
-    return;
-  }
   if (newPassword.length < 8) {
     res.status(400).json({ error: 'A nova senha deve ter no mínimo 8 caracteres.' });
     return;
   }
 
-  const newHash = hashSecret(newPassword);
-  const now = new Date().toISOString();
-  let newToken = '';
-  runInTransaction(() => {
-    db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE uid = ?').run(
-      newHash,
-      now,
-      user.uid
-    );
-    db.prepare('DELETE FROM sessions WHERE user_uid = ?').run(user.uid);
-    newToken = createSessionForUser(user.uid);
-  });
+  const row = db
+    .prepare('SELECT password_hash FROM users WHERE uid = ?')
+    .get(req.authUser!.uid) as Row | undefined;
+  if (!row || !verifySecret(currentPassword, String(row.password_hash))) {
+    res.status(401).json({ error: 'Senha atual incorreta.' });
+    return;
+  }
 
+  const now = new Date().toISOString();
+  db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE uid = ?').run(
+    hashSecret(newPassword),
+    now,
+    req.authUser!.uid
+  );
+  // Rotate sessions except a newly issued one
+  db.prepare('DELETE FROM sessions WHERE uid = ?').run(req.authUser!.uid);
+  const newToken = createSessionForUser(req.authUser!.uid);
   setSessionCookie(req, res, newToken);
   res.json({ ok: true, token: newToken });
 });
 
-// --- FAMILY ROUTES ---
-app.post('/api/family/create', requireAuth, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  if (user.family_id) {
-    res.status(409).json({ error: 'Você já está conectado a uma família.' });
+// --- Email Password Recovery Routes ---
+
+app.post('/api/recovery/request-code', recoveryLimiter, async (req: Request, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const email = clampEmail(body.email);
+
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: 'Informe um endereço de e-mail válido.' });
     return;
   }
 
-  const body = req.body as Record<string, unknown>;
-  const familyName = clampText(body.familyName, MAX_LENGTHS.familyName);
-  const displayName = clampText(body.displayName || user.display_name, MAX_LENGTHS.displayName);
-  const role =
-    typeof body.role === 'string' && VALID_ROLES.has(body.role) ? body.role : user.role;
+  const user = db.prepare('SELECT uid FROM users WHERE email = ?').get(email);
+  if (!user) {
+    res.status(404).json({ error: 'Nenhuma conta cadastrada com este e-mail.' });
+    return;
+  }
+
+  const code = generateSixDigitCode();
+  const codeHash = hashSecret(code);
+  const id = generateId('rec');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + CODE_TTL_MS).toISOString();
+
+  runInTransaction(() => {
+    db.prepare('DELETE FROM recovery_codes WHERE expires_at <= ?').run(now.toISOString());
+    db.prepare('UPDATE recovery_codes SET used = 1 WHERE email = ? AND used = 0').run(email);
+    db.prepare(
+      `INSERT INTO recovery_codes (id, email, code_hash, expires_at, used, attempts, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?)`
+    ).run(id, email, codeHash, expiresAt, now.toISOString());
+  });
+
+  try {
+    await sendRecoveryCodeEmail(email, code);
+    res.json({
+      ok: true,
+      expiresInMinutes: 10,
+      message: 'Código de 6 dígitos enviado para o e-mail informado.',
+    });
+  } catch (err) {
+    db.prepare('DELETE FROM recovery_codes WHERE id = ?').run(id);
+    const statusCode =
+      typeof (err as { statusCode?: unknown })?.statusCode === 'number'
+        ? (err as { statusCode: number }).statusCode
+        : 500;
+    const message =
+      err instanceof Error && statusCode === 503
+        ? err.message
+        : 'Não foi possível enviar o e-mail de verificação. Tente novamente em instantes.';
+    res.status(statusCode).json({ error: message });
+  }
+});
+
+app.post('/api/recovery/verify-code', recoveryLimiter, (req: Request, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const email = clampEmail(body.email);
+  const code = typeof body.code === 'string' ? body.code.replace(/\D/g, '') : '';
+
+  if (!email || code.length !== 6) {
+    res.status(400).json({ error: 'Informe o e-mail e o código de 6 dígitos.' });
+    return;
+  }
+
+  const row = db
+    .prepare(
+      `SELECT id, email, code_hash, expires_at, used, attempts, created_at
+       FROM recovery_codes
+       WHERE email = ? AND used = 0
+       ORDER BY created_at DESC
+       LIMIT 1`
+    )
+    .get(email) as
+    | { id: string; code_hash: string; expires_at: string; attempts: number }
+    | undefined;
+
+  if (!row) {
+    res.status(400).json({ error: 'Código inválido ou já utilizado. Solicite um novo código.' });
+    return;
+  }
+
+  if (new Date(row.expires_at).getTime() <= Date.now()) {
+    db.prepare('UPDATE recovery_codes SET used = 1 WHERE id = ?').run(row.id);
+    res.status(400).json({ error: 'Este código expirou após 10 minutos. Solicite um novo código.' });
+    return;
+  }
+
+  if (row.attempts >= MAX_VERIFY_ATTEMPTS) {
+    db.prepare('UPDATE recovery_codes SET used = 1 WHERE id = ?').run(row.id);
+    res.status(429).json({ error: 'Número máximo de tentativas excedido. Solicite um novo código.' });
+    return;
+  }
+
+  if (!verifySecret(code, row.code_hash)) {
+    const nextAttempts = row.attempts + 1;
+    db.prepare('UPDATE recovery_codes SET attempts = ?, used = ? WHERE id = ?').run(
+      nextAttempts,
+      nextAttempts >= MAX_VERIFY_ATTEMPTS ? 1 : 0,
+      row.id
+    );
+    res.status(400).json({ error: 'Código incorreto. Verifique os 6 dígitos enviados.' });
+    return;
+  }
+
+  const resetToken = generateSessionToken();
+  const now = new Date();
+  const resetExpires = new Date(now.getTime() + CODE_TTL_MS).toISOString();
+
+  runInTransaction(() => {
+    db.prepare('UPDATE recovery_codes SET used = 1 WHERE id = ?').run(row.id);
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE email = ? AND used = 0').run(email);
+    db.prepare(
+      'INSERT INTO password_reset_tokens (token_hash, email, expires_at, used, created_at) VALUES (?, ?, ?, 0, ?)'
+    ).run(hashToken(resetToken), email, resetExpires, now.toISOString());
+  });
+
+  res.json({ ok: true, email, resetToken });
+});
+
+app.post('/api/recovery/reset-password', recoveryLimiter, (req: Request, res: Response) => {
+  const body = (req.body || {}) as Record<string, unknown>;
+  const email = clampEmail(body.email);
+  const resetToken = typeof body.resetToken === 'string' ? body.resetToken.trim() : '';
+  const newPassword = typeof body.newPassword === 'string' ? body.newPassword : '';
+
+  if (!email || !resetToken || newPassword.length < 6) {
+    res.status(400).json({ error: 'Dados inválidos para redefinição de senha.' });
+    return;
+  }
+
+  const tokenRow = db
+    .prepare(
+      'SELECT token_hash, email, expires_at, used FROM password_reset_tokens WHERE token_hash = ? AND email = ? AND used = 0'
+    )
+    .get(hashToken(resetToken), email) as
+    | { token_hash: string; expires_at: string }
+    | undefined;
+
+  if (!tokenRow || new Date(tokenRow.expires_at).getTime() <= Date.now()) {
+    res.status(400).json({ error: 'Autorização expirada ou inválida. Solicite um novo código.' });
+    return;
+  }
+
+  const userRow = db.prepare('SELECT uid FROM users WHERE email = ?').get(email) as
+    | { uid: string }
+    | undefined;
+  if (!userRow) {
+    res.status(404).json({ error: 'Conta não encontrada.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  runInTransaction(() => {
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE token_hash = ?').run(
+      tokenRow.token_hash
+    );
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE uid = ?').run(
+      hashSecret(newPassword),
+      now,
+      userRow.uid
+    );
+    db.prepare('DELETE FROM sessions WHERE uid = ?').run(userRow.uid);
+  });
+
+  res.json({ ok: true });
+});
+
+// --- Family Routes ---
+
+app.post('/api/family/create', requireAuth, (req: RequestWithUser, res: Response) => {
+  const user = req.authUser!;
+  if (user.familyId) {
+    res.status(400).json({ error: 'Esta conta já participa de uma família.' });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const familyName = clampText(body.familyName, 80);
+  const displayName = clampText(body.displayName || user.displayName, 80);
+  const role = normalizeRole(body.role || user.role);
 
   if (!familyName || !displayName) {
-    res.status(400).json({ error: 'Informe o nome da família e o seu nome.' });
+    res.status(400).json({ error: 'Preencha o nome da família e o seu nome.' });
     return;
   }
 
-  const familyId = generateDocId('fam');
+  const familyId = generateId('fam');
   let inviteCode = generateInviteCode();
-  while (db.prepare('SELECT 1 FROM families WHERE invite_code = ?').get(inviteCode)) {
+  while (db.prepare('SELECT id FROM families WHERE invite_code = ?').get(inviteCode)) {
     inviteCode = generateInviteCode();
   }
   const now = new Date().toISOString();
@@ -901,83 +1059,65 @@ app.post('/api/family/create', requireAuth, (req: AuthedRequest, res: Response) 
     db.prepare(
       'INSERT INTO families (id, name, owner_id, invite_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
     ).run(familyId, familyName, user.uid, inviteCode, now, now);
-
     db.prepare(
-      'INSERT INTO family_members (family_id, uid, display_name, role, invite_code, joined_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(familyId, user.uid, displayName, role, inviteCode, now);
-
+      'INSERT INTO family_members (family_id, uid, display_name, role, joined_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(familyId, user.uid, displayName, role, now);
     db.prepare(
-      'UPDATE users SET display_name = ?, role = ?, family_id = ?, updated_at = ? WHERE uid = ?'
-    ).run(displayName, role, familyId, now, user.uid);
+      'UPDATE users SET family_id = ?, display_name = ?, role = ?, updated_at = ? WHERE uid = ?'
+    ).run(familyId, displayName, role, now, user.uid);
   });
 
-  const updatedUser = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as unknown as DbUserRow;
-  const { family, members } = getFamilyAndMembers(familyId);
-  res.status(201).json({ user: serializeUser(updatedUser), family, members });
+  const updated = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as Row;
+  res.json(getFamilyBundle(mapUserRow(updated)));
 });
 
-app.post('/api/family/join', requireAuth, (req: AuthedRequest, res: Response) => {
+app.post('/api/family/join', requireAuth, (req: RequestWithUser, res: Response) => {
   const user = req.authUser!;
-  if (user.family_id) {
-    res.status(409).json({ error: 'Você já está conectado a uma família.' });
+  if (user.familyId) {
+    res.status(400).json({ error: 'Esta conta já participa de uma família.' });
     return;
   }
 
-  const body = req.body as Record<string, unknown>;
-  const cleanCode =
-    typeof body.inviteCode === 'string'
-      ? body.inviteCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
-      : '';
-  const displayName = clampText(body.displayName || user.display_name, MAX_LENGTHS.displayName);
-  const role =
-    typeof body.role === 'string' && VALID_ROLES.has(body.role) ? body.role : user.role;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const code = clampText(body.inviteCode, 16)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+  const displayName = clampText(body.displayName || user.displayName, 80);
+  const role = normalizeRole(body.role || user.role);
 
-  if (cleanCode.length < 6 || cleanCode.length > 16) {
-    res.status(400).json({ error: 'Informe um código de convite válido.' });
-    return;
-  }
-  if (!displayName) {
-    res.status(400).json({ error: 'Informe o seu nome.' });
+  if (!code || !displayName) {
+    res.status(400).json({ error: 'Informe o código de convite e o seu nome.' });
     return;
   }
 
-  const famRow = db
-    .prepare('SELECT * FROM families WHERE invite_code = ?')
-    .get(cleanCode) as DbFamilyRow | undefined;
-
-  if (!famRow) {
-    res.status(404).json({
-      error: 'Código de convite não encontrado ou desativado. Verifique com seu cônjuge.',
-    });
+  const fam = db.prepare('SELECT id FROM families WHERE invite_code = ?').get(code) as
+    | { id: string }
+    | undefined;
+  if (!fam) {
+    res.status(404).json({ error: 'Código de convite não encontrado.' });
     return;
   }
 
   const now = new Date().toISOString();
   runInTransaction(() => {
     db.prepare(
-      `INSERT OR REPLACE INTO family_members (family_id, uid, display_name, role, invite_code, joined_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).run(famRow.id, user.uid, displayName, role, cleanCode, now);
-
+      'INSERT OR REPLACE INTO family_members (family_id, uid, display_name, role, joined_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(fam.id, user.uid, displayName, role, now);
     db.prepare(
-      `UPDATE users
-       SET display_name = ?, role = ?, family_id = ?, onboarding_completed = 1, updated_at = ?
-       WHERE uid = ?`
-    ).run(displayName, role, famRow.id, now, user.uid);
+      'UPDATE users SET family_id = ?, display_name = ?, role = ?, onboarding_completed = 1, updated_at = ? WHERE uid = ?'
+    ).run(fam.id, displayName, role, now, user.uid);
   });
 
-  broadcastFamilySync(famRow.id, 'family');
-  const updatedUser = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as unknown as DbUserRow;
-  const { family, members } = getFamilyAndMembers(famRow.id);
-  res.json({ user: serializeUser(updatedUser), family, members });
+  broadcastFamilySync(fam.id, 'family');
+  const updated = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as Row;
+  res.json(getFamilyBundle(mapUserRow(updated)));
 });
 
-app.patch('/api/family/profile', requireAuth, (req: AuthedRequest, res: Response) => {
+app.patch('/api/family/profile', requireAuth, (req: RequestWithUser, res: Response) => {
   const user = req.authUser!;
-  const body = req.body as Record<string, unknown>;
-  const displayName = clampText(body.displayName, MAX_LENGTHS.displayName);
-  const role =
-    typeof body.role === 'string' && VALID_ROLES.has(body.role) ? body.role : user.role;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const displayName = clampText(body.displayName, 80);
+  const role = normalizeRole(body.role);
 
   if (!displayName) {
     res.status(400).json({ error: 'Informe seu nome.' });
@@ -992,196 +1132,185 @@ app.patch('/api/family/profile', requireAuth, (req: AuthedRequest, res: Response
       now,
       user.uid
     );
-    if (user.family_id) {
-      db.prepare(
-        'UPDATE family_members SET display_name = ?, role = ? WHERE family_id = ? AND uid = ?'
-      ).run(displayName, role, user.family_id, user.uid);
-    }
+    db.prepare('UPDATE family_members SET display_name = ?, role = ? WHERE uid = ?').run(
+      displayName,
+      role,
+      user.uid
+    );
   });
 
-  broadcastFamilySync(user.family_id, 'family');
-  const updatedUser = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as unknown as DbUserRow;
-  const { family, members } = getFamilyAndMembers(updatedUser.family_id);
-  res.json({ user: serializeUser(updatedUser), family, members });
+  if (user.familyId) broadcastFamilySync(user.familyId, 'family');
+  const updated = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as Row;
+  res.json(getFamilyBundle(mapUserRow(updated)));
 });
 
-app.patch('/api/family/name', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const body = req.body as Record<string, unknown>;
-  const name = clampText(body.name, MAX_LENGTHS.familyName);
+app.patch('/api/family/name', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 80);
   if (!name) {
     res.status(400).json({ error: 'Informe o nome da família.' });
     return;
   }
 
-  const now = new Date().toISOString();
   db.prepare('UPDATE families SET name = ?, updated_at = ? WHERE id = ?').run(
     name,
-    now,
-    user.family_id!
+    new Date().toISOString(),
+    ctx.familyId
   );
 
-  broadcastFamilySync(user.family_id, 'family');
-  const { family, members } = getFamilyAndMembers(user.family_id);
-  res.json({ family, members });
+  broadcastFamilySync(ctx.familyId, 'family');
+  const bundle = getFamilyBundle(ctx.user);
+  res.json({ family: bundle.family, members: bundle.members });
 });
 
-app.post('/api/family/complete-onboarding', requireAuth, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
+app.post('/api/family/regenerate-invite', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const userRow = db
+    .prepare('SELECT password_hash FROM users WHERE uid = ?')
+    .get(ctx.user.uid) as Row | undefined;
+  if (!userRow || !verifySecret(currentPassword, String(userRow.password_hash))) {
+    res.status(401).json({ error: 'Senha atual incorreta.' });
+    return;
+  }
+
+  const fam = db.prepare('SELECT owner_id FROM families WHERE id = ?').get(ctx.familyId) as Row;
+  if (String(fam.owner_id) !== ctx.user.uid) {
+    res.status(403).json({ error: 'Apenas o administrador pode renovar o código.' });
+    return;
+  }
+
+  let nextCode = generateInviteCode();
+  while (db.prepare('SELECT id FROM families WHERE invite_code = ?').get(nextCode)) {
+    nextCode = generateInviteCode();
+  }
+
+  db.prepare('UPDATE families SET invite_code = ?, updated_at = ? WHERE id = ?').run(
+    nextCode,
+    new Date().toISOString(),
+    ctx.familyId
+  );
+
+  broadcastFamilySync(ctx.familyId, 'family');
+  const bundle = getFamilyBundle(ctx.user);
+  res.json({ inviteCode: nextCode, family: bundle.family, members: bundle.members });
+});
+
+app.delete('/api/family/members/:memberUid', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+
+  const memberUid = String(req.params.memberUid || '');
+  const body = (req.body || {}) as Record<string, unknown>;
+  const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const userRow = db
+    .prepare('SELECT password_hash FROM users WHERE uid = ?')
+    .get(ctx.user.uid) as Row | undefined;
+  if (!userRow || !verifySecret(currentPassword, String(userRow.password_hash))) {
+    res.status(401).json({ error: 'Senha atual incorreta.' });
+    return;
+  }
+
+  const fam = db.prepare('SELECT owner_id FROM families WHERE id = ?').get(ctx.familyId) as Row;
+  if (String(fam.owner_id) !== ctx.user.uid) {
+    res.status(403).json({ error: 'Apenas o administrador pode remover integrantes.' });
+    return;
+  }
+  if (memberUid === ctx.user.uid) {
+    res.status(400).json({ error: 'Você não pode remover a própria conta.' });
+    return;
+  }
+
   const now = new Date().toISOString();
+  runInTransaction(() => {
+    db.prepare('DELETE FROM family_members WHERE family_id = ? AND uid = ?').run(
+      ctx.familyId,
+      memberUid
+    );
+    db.prepare(
+      'UPDATE users SET family_id = NULL, updated_at = ? WHERE uid = ? AND family_id = ?'
+    ).run(now, memberUid, ctx.familyId);
+  });
+
+  broadcastFamilySync(ctx.familyId, 'family');
+  const bundle = getFamilyBundle(ctx.user);
+  res.json({ family: bundle.family, members: bundle.members });
+});
+
+app.post('/api/family/complete-onboarding', requireAuth, (req: RequestWithUser, res: Response) => {
+  const user = req.authUser!;
   db.prepare('UPDATE users SET onboarding_completed = 1, updated_at = ? WHERE uid = ?').run(
-    now,
+    new Date().toISOString(),
     user.uid
   );
-  const updatedUser = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as unknown as DbUserRow;
-  res.json({ user: serializeUser(updatedUser) });
+  const updated = db.prepare('SELECT * FROM users WHERE uid = ?').get(user.uid) as Row;
+  res.json({ user: mapUserRow(updated) });
 });
 
-app.post(
-  '/api/family/regenerate-invite',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const body = req.body as Record<string, unknown>;
-    const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+// --- SSE Events Endpoint ---
 
-    if (!currentPassword || !verifySecret(currentPassword, user.password_hash)) {
-      res.status(401).json({ error: 'Senha incorreta. Confirme sua identidade para prosseguir.' });
-      return;
-    }
+app.get('/api/events', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
 
-    const famRow = db
-      .prepare('SELECT * FROM families WHERE id = ?')
-      .get(user.family_id!) as DbFamilyRow | undefined;
-    if (!famRow || famRow.owner_id !== user.uid) {
-      res.status(403).json({ error: 'Somente o administrador da família pode renovar o convite.' });
-      return;
-    }
-
-    let newCode = generateInviteCode();
-    while (db.prepare('SELECT 1 FROM families WHERE invite_code = ?').get(newCode)) {
-      newCode = generateInviteCode();
-    }
-    const now = new Date().toISOString();
-    db.prepare('UPDATE families SET invite_code = ?, updated_at = ? WHERE id = ?').run(
-      newCode,
-      now,
-      famRow.id
-    );
-
-    broadcastFamilySync(famRow.id, 'family');
-    const { family, members } = getFamilyAndMembers(famRow.id);
-    res.json({ inviteCode: newCode, family, members });
-  }
-);
-
-app.delete(
-  '/api/family/members/:memberUid',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const memberUid = sanitizeId(req.params.memberUid);
-    const body = (req.body || {}) as Record<string, unknown>;
-    const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
-
-    if (!currentPassword || !verifySecret(currentPassword, user.password_hash)) {
-      res.status(401).json({ error: 'Senha incorreta. Confirme sua identidade para prosseguir.' });
-      return;
-    }
-
-    if (!memberUid) {
-      res.status(400).json({ error: 'Integrante inválido.' });
-      return;
-    }
-
-    const famRow = db
-      .prepare('SELECT * FROM families WHERE id = ?')
-      .get(user.family_id!) as DbFamilyRow | undefined;
-    if (!famRow || famRow.owner_id !== user.uid) {
-      res.status(403).json({ error: 'Somente o administrador da família pode revogar acessos.' });
-      return;
-    }
-    if (memberUid === famRow.owner_id) {
-      res.status(400).json({ error: 'O administrador principal da família não pode ser removido.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    runInTransaction(() => {
-      db.prepare('DELETE FROM family_members WHERE family_id = ? AND uid = ?').run(
-        famRow.id,
-        memberUid
-      );
-      db.prepare('UPDATE users SET family_id = NULL, updated_at = ? WHERE uid = ?').run(
-        now,
-        memberUid
-      );
-    });
-
-    broadcastFamilySync(famRow.id, 'family');
-    const { family, members } = getFamilyAndMembers(famRow.id);
-    res.json({ family, members });
-  }
-);
-
-// --- REAL-TIME SYNC STREAM (SSE over fetch with Bearer or Cookie) ---
-app.get('/api/events', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const familyId = req.authUser!.family_id!;
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  let set = familyStreams.get(familyId);
+  let set = sseClients.get(ctx.familyId);
   if (!set) {
     set = new Set();
-    familyStreams.set(familyId, set);
+    sseClients.set(ctx.familyId, set);
   }
   set.add(res);
-  res.write(`data: ${JSON.stringify({ type: 'connected', ts: Date.now() })}\n\n`);
 
-  const keepAlive = setInterval(() => {
+  const heartbeat = setInterval(() => {
     try {
       res.write(': ping\n\n');
     } catch {
-      clearInterval(keepAlive);
+      // ignore
     }
   }, 25_000);
 
   req.on('close', () => {
-    clearInterval(keepAlive);
-    familyStreams.get(familyId)?.delete(res);
+    clearInterval(heartbeat);
+    set?.delete(res);
   });
 });
 
-// --- FINANCE ROUTES ---
-app.get('/api/finance/snapshot', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const familyId = req.authUser!.family_id!;
-  res.json(getFinanceSnapshot(familyId));
+// --- Finance API Routes ---
+
+app.get('/api/finance/snapshot', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.post('/api/finance/incomes', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const familyId = user.family_id!;
-  const body = req.body as Record<string, unknown>;
+app.post('/api/finance/incomes', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
 
-  const description = clampText(body.description, MAX_LENGTHS.description);
+  const body = (req.body || {}) as Record<string, unknown>;
+  const description = clampText(body.description, 140);
   const amount = clampAmount(body.amount);
-  const date = sanitizeDateISO(body.date);
-  const category = clampText(body.category, MAX_LENGTHS.category) || 'Outros recebimentos';
-  const responsibleName =
-    clampText(body.responsibleName, MAX_LENGTHS.displayName) || user.display_name;
-  const responsibleUid = sanitizeId(body.responsibleUid) || user.uid;
-  const notes = clampText(body.notes, MAX_LENGTHS.notes);
+  const date = normalizeIsoDate(body.date, getTodayBrazilISO());
+  const category = clampText(body.category || 'Outros recebimentos', 60);
+  const responsibleName = clampText(body.responsibleName || ctx.user.displayName, 80);
+  const notes = clampText(body.notes, 500);
 
-  if (!description || amount <= 0 || !date) {
-    res.status(400).json({ error: 'Preencha descrição, valor maior que zero e data válida.' });
+  if (!description || amount <= 0) {
+    res.status(400).json({ error: 'Informe descrição e valor positivo para a receita.' });
     return;
   }
 
-  const id = generateDocId('inc');
+  const id = generateId('inc');
   const now = new Date().toISOString();
 
   runInTransaction(() => {
@@ -1192,73 +1321,62 @@ app.post('/api/finance/incomes', requireAuth, requireFamily, (req: AuthedRequest
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
-      familyId,
+      ctx.familyId,
       description,
       amount,
       date,
       category,
       responsibleName,
-      responsibleUid,
+      ctx.user.uid,
       notes,
-      user.uid,
-      user.display_name,
+      ctx.user.uid,
+      ctx.user.displayName,
       now,
       now
     );
-
     insertAuditLog({
-      familyId,
+      familyId: ctx.familyId,
       action: 'criar',
-      entityType: 'Receita',
+      entityType: 'receita',
       entityId: id,
-      summary: `Registrou receita "${description}" (${formatBRLServer(amount)})`,
+      summary: `Receita adicionada: ${description}`,
       amount,
-      user,
+      user: ctx.user,
     });
   });
 
-  broadcastFamilySync(familyId, 'finance');
-  res.status(201).json(getFinanceSnapshot(familyId));
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.put('/api/finance/incomes/:id', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const familyId = user.family_id!;
-  const id = sanitizeId(req.params.id);
-  const body = req.body as Record<string, unknown>;
-
-  if (!id) {
-    res.status(400).json({ error: 'Identificador inválido.' });
-    return;
-  }
-
-  const description = clampText(body.description, MAX_LENGTHS.description);
-  const amount = clampAmount(body.amount);
-  const date = sanitizeDateISO(body.date);
-  const category = clampText(body.category, MAX_LENGTHS.category) || 'Outros recebimentos';
-  const responsibleName =
-    clampText(body.responsibleName, MAX_LENGTHS.displayName) || user.display_name;
-  const responsibleUid = sanitizeId(body.responsibleUid) || user.uid;
-  const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-  if (!description || amount <= 0 || !date) {
-    res.status(400).json({ error: 'Preencha descrição, valor maior que zero e data válida.' });
-    return;
-  }
-
+app.put('/api/finance/incomes/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
   const existing = db
     .prepare('SELECT id FROM incomes WHERE id = ? AND family_id = ?')
-    .get(id, familyId);
+    .get(id, ctx.familyId);
   if (!existing) {
     res.status(404).json({ error: 'Receita não encontrada.' });
     return;
   }
 
-  const now = new Date().toISOString();
+  const body = (req.body || {}) as Record<string, unknown>;
+  const description = clampText(body.description, 140);
+  const amount = clampAmount(body.amount);
+  const date = normalizeIsoDate(body.date, getTodayBrazilISO());
+  const category = clampText(body.category || 'Outros recebimentos', 60);
+  const responsibleName = clampText(body.responsibleName || ctx.user.displayName, 80);
+  const notes = clampText(body.notes, 500);
+
+  if (!description || amount <= 0) {
+    res.status(400).json({ error: 'Informe descrição e valor positivo para a receita.' });
+    return;
+  }
+
   runInTransaction(() => {
     db.prepare(
-      `UPDATE incomes
-       SET description = ?, amount = ?, date = ?, category = ?, responsible_name = ?, responsible_uid = ?, notes = ?, updated_at = ?
+      `UPDATE incomes SET description = ?, amount = ?, date = ?, category = ?, responsible_name = ?, notes = ?, updated_at = ?
        WHERE id = ? AND family_id = ?`
     ).run(
       description,
@@ -1266,625 +1384,498 @@ app.put('/api/finance/incomes/:id', requireAuth, requireFamily, (req: AuthedRequ
       date,
       category,
       responsibleName,
-      responsibleUid,
       notes,
-      now,
+      new Date().toISOString(),
       id,
-      familyId
+      ctx.familyId
     );
     insertAuditLog({
-      familyId,
+      familyId: ctx.familyId,
       action: 'editar',
-      entityType: 'Receita',
+      entityType: 'receita',
       entityId: id,
-      summary: `Editou receita "${description}" (${formatBRLServer(amount)})`,
+      summary: `Receita atualizada: ${description}`,
       amount,
-      user,
+      user: ctx.user,
     });
   });
 
-  broadcastFamilySync(familyId, 'finance');
-  res.json(getFinanceSnapshot(familyId));
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.delete(
-  '/api/finance/incomes/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const row = db
-      .prepare('SELECT id, description, amount FROM incomes WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as { id: string; description: string; amount: number } | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Receita não encontrada.' });
-      return;
-    }
-
-    runInTransaction(() => {
-      db.prepare('DELETE FROM incomes WHERE id = ? AND family_id = ?').run(id, familyId);
-      insertAuditLog({
-        familyId,
-        action: 'excluir',
-        entityType: 'Receita',
-        entityId: id,
-        summary: `Excluiu receita "${row.description}" (${formatBRLServer(Number(row.amount))})`,
-        amount: Number(row.amount),
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.post('/api/finance/expenses', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const familyId = user.family_id!;
-  const body = req.body as Record<string, unknown>;
-
-  const baseDesc = clampText(body.description, MAX_LENGTHS.description);
-  const category = clampText(body.category, MAX_LENGTHS.category) || 'Outras Despesas';
-  const subcategory = clampText(body.subcategory, MAX_LENGTHS.subcategory) || 'Outros';
-  const totalAmount = clampAmount(body.amount);
-  const date = sanitizeDateISO(body.date);
-  const paymentMethod = clampText(body.paymentMethod, MAX_LENGTHS.paymentMethod) || 'PIX';
-  const responsibleName =
-    clampText(body.responsibleName, MAX_LENGTHS.displayName) || user.display_name;
-  const responsibleUid = sanitizeId(body.responsibleUid) || user.uid;
-  const notes = clampText(body.notes, MAX_LENGTHS.notes);
-  const status = body.status === 'pendente' ? 'pendente' : 'pago';
-  const isRecurring = Boolean(body.isRecurring);
-  const rawInstallments = Number(body.installments || 1);
-  const installments = Number.isFinite(rawInstallments)
-    ? Math.max(1, Math.min(Math.round(rawInstallments), 60))
-    : 1;
-
-  if (!baseDesc || totalAmount <= 0 || !date) {
-    res.status(400).json({ error: 'Preencha descrição, valor maior que zero e data válida.' });
+app.delete('/api/finance/incomes/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const row = db
+    .prepare('SELECT description, amount FROM incomes WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Receita não encontrada.' });
     return;
   }
 
-  const isInstallment = installments > 1;
-  const installmentGroupId = isInstallment ? generateDocId('parc') : null;
-  const perInstallment = isInstallment ? clampAmount(totalAmount / installments) : totalAmount;
+  runInTransaction(() => {
+    db.prepare('DELETE FROM incomes WHERE id = ? AND family_id = ?').run(id, ctx.familyId);
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'excluir',
+      entityType: 'receita',
+      entityId: id,
+      summary: `Receita excluída: ${String(row.description)}`,
+      amount: Number(row.amount),
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/expenses', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const description = clampText(body.description, 140);
+  const category = clampText(body.category || 'Outras Despesas', 60);
+  const subcategory = clampText(body.subcategory || 'Outros', 60);
+  const amount = clampAmount(body.amount);
+  const date = normalizeIsoDate(body.date, getTodayBrazilISO());
+  const paymentMethod = clampText(body.paymentMethod || 'PIX', 40);
+  const responsibleName = clampText(body.responsibleName || ctx.user.displayName, 80);
+  const notes = clampText(body.notes, 500);
+  const baseStatus = body.status === 'pendente' ? 'pendente' : 'pago';
+  const totalInstallments = Math.max(1, Math.min(60, Math.round(Number(body.installments) || 1)));
+  const isInstallment = totalInstallments > 1;
+  const isRecurring = Boolean(body.isRecurring);
+
+  if (!description || amount <= 0) {
+    res.status(400).json({ error: 'Informe descrição e valor positivo para a despesa.' });
+    return;
+  }
+
+  const groupId = isInstallment ? generateId('grp') : null;
   const now = new Date().toISOString();
 
   runInTransaction(() => {
-    const stmt = db.prepare(
-      `INSERT INTO expenses (
-        id, family_id, description, category, subcategory, amount, date, payment_method,
-        responsible_name, responsible_uid, notes, status, is_installment,
-        installment_group_id, installment_number, total_installments, is_recurring,
-        fixed_bill_id, reference_month, created_by_uid, created_by_name, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)`
-    );
-
-    let lastId = '';
-    for (let i = 0; i < installments; i++) {
-      const id = generateDocId('exp');
-      lastId = id;
-      const instDate = isInstallment ? addMonthsToISO(date, i) : date;
-      const desc = isInstallment
-        ? clampText(`${baseDesc} (${i + 1}/${installments})`, MAX_LENGTHS.description)
-        : baseDesc;
-
-      stmt.run(
-        id,
-        familyId,
-        desc,
+    for (let i = 0; i < totalInstallments; i++) {
+      const itemDate = i === 0 ? date : addMonthsToISO(date, i);
+      const itemStatus = i === 0 ? baseStatus : 'pendente';
+      const itemDesc = isInstallment ? `${description} (${i + 1}/${totalInstallments})` : description;
+      db.prepare(
+        `INSERT INTO expenses (
+          id, family_id, description, category, subcategory, amount, date, payment_method,
+          responsible_name, responsible_uid, notes, status, is_installment, installment_group_id,
+          installment_number, total_installments, is_recurring, reference_month,
+          created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('exp'),
+        ctx.familyId,
+        clampText(itemDesc, 140),
         category,
         subcategory,
-        perInstallment,
-        instDate,
+        amount,
+        itemDate,
         paymentMethod,
         responsibleName,
-        responsibleUid,
+        ctx.user.uid,
         notes,
-        i === 0 ? status : 'pendente',
+        itemStatus,
         isInstallment ? 1 : 0,
-        installmentGroupId,
+        groupId,
         isInstallment ? i + 1 : null,
-        isInstallment ? installments : null,
+        isInstallment ? totalInstallments : null,
         isRecurring ? 1 : 0,
-        instDate.slice(0, 7),
-        user.uid,
-        user.display_name,
+        itemDate.slice(0, 7),
+        ctx.user.uid,
+        ctx.user.displayName,
         now,
         now
       );
     }
-
     insertAuditLog({
-      familyId,
+      familyId: ctx.familyId,
       action: 'criar',
-      entityType: 'Despesa',
-      entityId: installmentGroupId || lastId,
+      entityType: 'despesa',
+      entityId: groupId || description,
       summary: isInstallment
-        ? `Registrou despesa parcelada "${baseDesc}" em ${installments}x (total ${formatBRLServer(totalAmount)})`
-        : `Registrou despesa "${baseDesc}" (${formatBRLServer(totalAmount)})`,
-      amount: totalAmount,
-      user,
+        ? `Despesa parcelada (${totalInstallments}x): ${description}`
+        : `Despesa adicionada: ${description}`,
+      amount: isInstallment ? amount * totalInstallments : amount,
+      user: ctx.user,
     });
   });
 
-  broadcastFamilySync(familyId, 'finance');
-  res.status(201).json(getFinanceSnapshot(familyId));
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.put(
-  '/api/finance/expenses/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    const body = req.body as Record<string, unknown>;
-
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const description = clampText(body.description, MAX_LENGTHS.description);
-    const category = clampText(body.category, MAX_LENGTHS.category) || 'Outras Despesas';
-    const subcategory = clampText(body.subcategory, MAX_LENGTHS.subcategory) || 'Outros';
-    const amount = clampAmount(body.amount);
-    const date = sanitizeDateISO(body.date);
-    const paymentMethod = clampText(body.paymentMethod, MAX_LENGTHS.paymentMethod) || 'PIX';
-    const responsibleName =
-      clampText(body.responsibleName, MAX_LENGTHS.displayName) || user.display_name;
-    const responsibleUid = sanitizeId(body.responsibleUid) || user.uid;
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-    const status = body.status === 'pendente' ? 'pendente' : 'pago';
-
-    if (!description || amount <= 0 || !date) {
-      res.status(400).json({ error: 'Preencha descrição, valor maior que zero e data válida.' });
-      return;
-    }
-
-    const existing = db
-      .prepare('SELECT id FROM expenses WHERE id = ? AND family_id = ?')
-      .get(id, familyId);
-    if (!existing) {
-      res.status(404).json({ error: 'Despesa não encontrada.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    runInTransaction(() => {
-      db.prepare(
-        `UPDATE expenses
-         SET description = ?, category = ?, subcategory = ?, amount = ?, date = ?, payment_method = ?,
-             responsible_name = ?, responsible_uid = ?, notes = ?, status = ?, reference_month = ?, updated_at = ?
-         WHERE id = ? AND family_id = ?`
-      ).run(
-        description,
-        category,
-        subcategory,
-        amount,
-        date,
-        paymentMethod,
-        responsibleName,
-        responsibleUid,
-        notes,
-        status,
-        date.slice(0, 7),
-        now,
-        id,
-        familyId
-      );
-
-      insertAuditLog({
-        familyId,
-        action: 'editar',
-        entityType: 'Despesa',
-        entityId: id,
-        summary: `Editou despesa "${description}" (${formatBRLServer(amount)})`,
-        amount,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
+app.put('/api/finance/expenses/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const existing = db
+    .prepare('SELECT id FROM expenses WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId);
+  if (!existing) {
+    res.status(404).json({ error: 'Despesa não encontrada.' });
+    return;
   }
-);
 
-app.patch(
-  '/api/finance/expenses/:id/toggle',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
+  const body = (req.body || {}) as Record<string, unknown>;
+  const description = clampText(body.description, 140);
+  const category = clampText(body.category || 'Outras Despesas', 60);
+  const subcategory = clampText(body.subcategory || 'Outros', 60);
+  const amount = clampAmount(body.amount);
+  const date = normalizeIsoDate(body.date, getTodayBrazilISO());
+  const paymentMethod = clampText(body.paymentMethod || 'PIX', 40);
+  const responsibleName = clampText(body.responsibleName || ctx.user.displayName, 80);
+  const notes = clampText(body.notes, 500);
+  const status = body.status === 'pendente' ? 'pendente' : 'pago';
 
-    const row = db
-      .prepare('SELECT status FROM expenses WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as { status: string } | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Despesa não encontrada.' });
-      return;
-    }
+  if (!description || amount <= 0) {
+    res.status(400).json({ error: 'Informe descrição e valor positivo para a despesa.' });
+    return;
+  }
 
-    const nextStatus = row.status === 'pago' ? 'pendente' : 'pago';
+  runInTransaction(() => {
+    db.prepare(
+      `UPDATE expenses SET
+        description = ?, category = ?, subcategory = ?, amount = ?, date = ?,
+        payment_method = ?, responsible_name = ?, notes = ?, status = ?, reference_month = ?, updated_at = ?
+       WHERE id = ? AND family_id = ?`
+    ).run(
+      description,
+      category,
+      subcategory,
+      amount,
+      date,
+      paymentMethod,
+      responsibleName,
+      notes,
+      status,
+      date.slice(0, 7),
+      new Date().toISOString(),
+      id,
+      ctx.familyId
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'editar',
+      entityType: 'despesa',
+      entityId: id,
+      summary: `Despesa editada: ${description}`,
+      amount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.patch('/api/finance/expenses/:id/toggle', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const row = db
+    .prepare('SELECT description, amount, status FROM expenses WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Despesa não encontrada.' });
+    return;
+  }
+
+  const nextStatus = row.status === 'pago' ? 'pendente' : 'pago';
+  runInTransaction(() => {
     db.prepare('UPDATE expenses SET status = ?, updated_at = ? WHERE id = ? AND family_id = ?').run(
       nextStatus,
       new Date().toISOString(),
       id,
-      familyId
+      ctx.familyId
     );
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.delete(
-  '/api/finance/expenses/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const row = db
-      .prepare('SELECT id, description, amount FROM expenses WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as { id: string; description: string; amount: number } | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Despesa não encontrada.' });
-      return;
-    }
-
-    runInTransaction(() => {
-      db.prepare('DELETE FROM expenses WHERE id = ? AND family_id = ?').run(id, familyId);
-      insertAuditLog({
-        familyId,
-        action: 'excluir',
-        entityType: 'Despesa',
-        entityId: id,
-        summary: `Excluiu despesa "${row.description}" (${formatBRLServer(Number(row.amount))})`,
-        amount: Number(row.amount),
-        user,
-      });
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'pagamento',
+      entityType: 'despesa',
+      entityId: id,
+      summary: `Despesa marcada como ${nextStatus}: ${String(row.description)}`,
+      amount: Number(row.amount),
+      user: ctx.user,
     });
+  });
 
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
 
-// --- FIXED BILLS ---
-app.post(
-  '/api/finance/fixed-bills',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const body = req.body as Record<string, unknown>;
-
-    const name = clampText(body.name, MAX_LENGTHS.billName);
-    const expectedAmount = clampAmount(body.expectedAmount);
-    const dueDay = Math.min(Math.max(Math.round(Number(body.dueDay || 10)), 1), 31);
-    const frequency =
-      typeof body.frequency === 'string' && VALID_FREQUENCIES.has(body.frequency)
-        ? body.frequency
-        : 'mensal';
-    const category = clampText(body.category, MAX_LENGTHS.category) || 'Contas da Casa';
-    const subcategory = clampText(body.subcategory, MAX_LENGTHS.subcategory) || 'Outras contas';
-    const active = body.active !== false;
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-    if (!name || expectedAmount <= 0) {
-      res.status(400).json({ error: 'Informe nome e valor previsto maior que zero.' });
-      return;
-    }
-
-    const id = generateDocId('bill');
-    const now = new Date().toISOString();
-
-    runInTransaction(() => {
-      db.prepare(
-        `INSERT INTO fixed_bills (
-          id, family_id, name, expected_amount, due_day, frequency, category, subcategory,
-          last_paid_month, last_paid_date, last_paid_amount, active, notes,
-          created_by_uid, created_by_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        id,
-        familyId,
-        name,
-        expectedAmount,
-        dueDay,
-        frequency,
-        category,
-        subcategory,
-        active ? 1 : 0,
-        notes,
-        user.uid,
-        user.display_name,
-        now,
-        now
-      );
-      insertAuditLog({
-        familyId,
-        action: 'criar',
-        entityType: 'Conta Fixa',
-        entityId: id,
-        summary: `Cadastrou conta fixa "${name}" (${formatBRLServer(expectedAmount)})`,
-        amount: expectedAmount,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.status(201).json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.put(
-  '/api/finance/fixed-bills/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    const body = req.body as Record<string, unknown>;
-
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const name = clampText(body.name, MAX_LENGTHS.billName);
-    const expectedAmount = clampAmount(body.expectedAmount);
-    const dueDay = Math.min(Math.max(Math.round(Number(body.dueDay || 10)), 1), 31);
-    const frequency =
-      typeof body.frequency === 'string' && VALID_FREQUENCIES.has(body.frequency)
-        ? body.frequency
-        : 'mensal';
-    const category = clampText(body.category, MAX_LENGTHS.category) || 'Contas da Casa';
-    const subcategory = clampText(body.subcategory, MAX_LENGTHS.subcategory) || 'Outras contas';
-    const active = body.active !== false;
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-    if (!name || expectedAmount <= 0) {
-      res.status(400).json({ error: 'Informe nome e valor previsto maior que zero.' });
-      return;
-    }
-
-    const existing = db
-      .prepare('SELECT id FROM fixed_bills WHERE id = ? AND family_id = ?')
-      .get(id, familyId);
-    if (!existing) {
-      res.status(404).json({ error: 'Conta fixa não encontrada.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    runInTransaction(() => {
-      db.prepare(
-        `UPDATE fixed_bills
-         SET name = ?, expected_amount = ?, due_day = ?, frequency = ?, category = ?, subcategory = ?,
-             active = ?, notes = ?, updated_at = ?
-         WHERE id = ? AND family_id = ?`
-      ).run(
-        name,
-        expectedAmount,
-        dueDay,
-        frequency,
-        category,
-        subcategory,
-        active ? 1 : 0,
-        notes,
-        now,
-        id,
-        familyId
-      );
-      insertAuditLog({
-        familyId,
-        action: 'editar',
-        entityType: 'Conta Fixa',
-        entityId: id,
-        summary: `Atualizou conta fixa "${name}"`,
-        amount: expectedAmount,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.post(
-  '/api/finance/fixed-bills/:id/pay',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    const body = req.body as Record<string, unknown>;
-
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const amount = clampAmount(body.paidAmount);
-    const paidDate = sanitizeDateISO(body.paidDate);
-    const paymentMethod = clampText(body.paymentMethod, MAX_LENGTHS.paymentMethod) || 'PIX';
-
-    if (amount <= 0 || !paidDate) {
-      res.status(400).json({ error: 'Informe um valor pago maior que zero e data válida.' });
-      return;
-    }
-
-    const bill = db
-      .prepare('SELECT * FROM fixed_bills WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as Record<string, unknown> | undefined;
-    if (!bill) {
-      res.status(404).json({ error: 'Conta fixa não encontrada.' });
-      return;
-    }
-
-    const refMonth = paidDate.slice(0, 7);
-    const existingExp = db
-      .prepare('SELECT 1 FROM expenses WHERE family_id = ? AND fixed_bill_id = ? AND reference_month = ?')
-      .get(familyId, id, refMonth);
-
-    if (bill.last_paid_month === refMonth || existingExp) {
-      res.status(409).json({
-        error: `Esta conta fixa já foi confirmada como paga em ${refMonth}.`,
-      });
-      return;
-    }
-
-    const expId = `fix_${id}_${refMonth}`.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 120);
-    const now = new Date().toISOString();
-
-    runInTransaction(() => {
-      db.prepare(
-        `UPDATE fixed_bills
-         SET last_paid_month = ?, last_paid_date = ?, last_paid_amount = ?, updated_at = ?
-         WHERE id = ? AND family_id = ?`
-      ).run(refMonth, paidDate, amount, now, id, familyId);
-
-      db.prepare(
-        `INSERT INTO expenses (
-          id, family_id, description, category, subcategory, amount, date, payment_method,
-          responsible_name, responsible_uid, notes, status, is_installment,
-          installment_group_id, installment_number, total_installments, is_recurring,
-          fixed_bill_id, reference_month, created_by_uid, created_by_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pago', 0, NULL, NULL, NULL, 1, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        expId,
-        familyId,
-        clampText(`${String(bill.name)} (Conta Fixa)`, MAX_LENGTHS.description),
-        clampText(bill.category, MAX_LENGTHS.category),
-        clampText(bill.subcategory, MAX_LENGTHS.subcategory),
-        amount,
-        paidDate,
-        paymentMethod,
-        user.display_name,
-        user.uid,
-        clampText(`Pagamento confirmado da conta fixa ${String(bill.name)}`, MAX_LENGTHS.notes),
-        id,
-        refMonth,
-        user.uid,
-        user.display_name,
-        now,
-        now
-      );
-
-      insertAuditLog({
-        familyId,
-        action: 'pagamento',
-        entityType: 'Conta Fixa',
-        entityId: id,
-        summary: `Confirmou pagamento de "${String(bill.name)}" (${formatBRLServer(amount)})`,
-        amount,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.delete(
-  '/api/finance/fixed-bills/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const row = db
-      .prepare('SELECT id, name, expected_amount FROM fixed_bills WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as { id: string; name: string; expected_amount: number } | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Conta fixa não encontrada.' });
-      return;
-    }
-
-    runInTransaction(() => {
-      db.prepare('DELETE FROM fixed_bills WHERE id = ? AND family_id = ?').run(id, familyId);
-      insertAuditLog({
-        familyId,
-        action: 'excluir',
-        entityType: 'Conta Fixa',
-        entityId: id,
-        summary: `Removeu conta fixa "${row.name}"`,
-        amount: Number(row.expected_amount),
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-// --- DEBTS ---
-app.post('/api/finance/debts', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const familyId = user.family_id!;
-  const body = req.body as Record<string, unknown>;
-
-  const name = clampText(body.name, MAX_LENGTHS.debtName);
-  const creditor = clampText(body.creditor, MAX_LENGTHS.creditor) || 'Credor';
-  const originalAmount = clampAmount(body.originalAmount);
-  const currentAmount = clampAmount(body.currentAmount);
-  const installmentAmount = clampAmount(body.installmentAmount);
-  const totalInstallments = Math.max(
-    1,
-    Math.min(Math.round(Number(body.totalInstallments || 1)), 600)
-  );
-  const paidInstallments = Math.max(
-    0,
-    Math.min(Math.round(Number(body.paidInstallments || 0)), totalInstallments)
-  );
-  const rawInterest = Number(body.interestRate || 0);
-  const interestRate = Number.isFinite(rawInterest) ? Math.max(0, Math.min(rawInterest, 1000)) : 0;
-  const dueDate = sanitizeDateISO(body.dueDate);
-  const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-  if (!name || originalAmount <= 0 || !dueDate) {
-    res.status(400).json({ error: 'Preencha nome, valor original maior que zero e data válida.' });
+app.delete('/api/finance/expenses/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const row = db
+    .prepare('SELECT description, amount FROM expenses WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Despesa não encontrada.' });
     return;
   }
 
-  const status = currentAmount <= 0 || paidInstallments >= totalInstallments ? 'quitada' : 'ativa';
-  const id = generateDocId('debt');
+  runInTransaction(() => {
+    db.prepare('DELETE FROM expenses WHERE id = ? AND family_id = ?').run(id, ctx.familyId);
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'excluir',
+      entityType: 'despesa',
+      entityId: id,
+      summary: `Despesa excluída: ${String(row.description)}`,
+      amount: Number(row.amount),
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/fixed-bills', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 100);
+  const expectedAmount = clampAmount(body.expectedAmount);
+  const dueDay = Math.max(1, Math.min(31, Math.round(Number(body.dueDay) || 10)));
+  const frequency = normalizeFrequency(body.frequency);
+  const category = clampText(body.category || 'Contas da Casa', 60);
+  const subcategory = clampText(body.subcategory || 'Outras contas', 60);
+  const active = body.active !== false ? 1 : 0;
+  const notes = clampText(body.notes, 500);
+
+  if (!name || expectedAmount <= 0) {
+    res.status(400).json({ error: 'Informe nome e valor previsto para a conta fixa.' });
+    return;
+  }
+
+  const id = generateId('bill');
+  const now = new Date().toISOString();
+
+  runInTransaction(() => {
+    db.prepare(
+      `INSERT INTO fixed_bills (
+        id, family_id, name, expected_amount, due_day, frequency, category, subcategory,
+        last_paid_month, last_paid_date, last_paid_amount, active, notes,
+        created_by_uid, created_by_name, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      ctx.familyId,
+      name,
+      expectedAmount,
+      dueDay,
+      frequency,
+      category,
+      subcategory,
+      active,
+      notes,
+      ctx.user.uid,
+      ctx.user.displayName,
+      now,
+      now
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'criar',
+      entityType: 'conta_fixa',
+      entityId: id,
+      summary: `Conta fixa cadastrada: ${name}`,
+      amount: expectedAmount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.put('/api/finance/fixed-bills/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const existing = db
+    .prepare('SELECT id FROM fixed_bills WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId);
+  if (!existing) {
+    res.status(404).json({ error: 'Conta fixa não encontrada.' });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 100);
+  const expectedAmount = clampAmount(body.expectedAmount);
+  const dueDay = Math.max(1, Math.min(31, Math.round(Number(body.dueDay) || 10)));
+  const frequency = normalizeFrequency(body.frequency);
+  const category = clampText(body.category || 'Contas da Casa', 60);
+  const subcategory = clampText(body.subcategory || 'Outras contas', 60);
+  const active = body.active !== false ? 1 : 0;
+  const notes = clampText(body.notes, 500);
+
+  runInTransaction(() => {
+    db.prepare(
+      `UPDATE fixed_bills SET
+        name = ?, expected_amount = ?, due_day = ?, frequency = ?, category = ?,
+        subcategory = ?, active = ?, notes = ?, updated_at = ?
+       WHERE id = ? AND family_id = ?`
+    ).run(
+      name,
+      expectedAmount,
+      dueDay,
+      frequency,
+      category,
+      subcategory,
+      active,
+      notes,
+      new Date().toISOString(),
+      id,
+      ctx.familyId
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'editar',
+      entityType: 'conta_fixa',
+      entityId: id,
+      summary: `Conta fixa atualizada: ${name}`,
+      amount: expectedAmount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/fixed-bills/:id/pay', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const billId = String(req.params.id || '');
+  const bill = db
+    .prepare('SELECT * FROM fixed_bills WHERE id = ? AND family_id = ?')
+    .get(billId, ctx.familyId) as Row | undefined;
+  if (!bill) {
+    res.status(404).json({ error: 'Conta fixa não encontrada.' });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const paidAmount = clampAmount(body.paidAmount);
+  const paidDate = normalizeIsoDate(body.paidDate, getTodayBrazilISO());
+  const paidMonth = paidDate.slice(0, 7);
+  const paymentMethod = clampText(body.paymentMethod || 'PIX', 40);
+
+  if (paidAmount <= 0) {
+    res.status(400).json({ error: 'Informe um valor pago positivo.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  runInTransaction(() => {
+    db.prepare(
+      `UPDATE fixed_bills SET last_paid_month = ?, last_paid_date = ?, last_paid_amount = ?, updated_at = ?
+       WHERE id = ? AND family_id = ?`
+    ).run(paidMonth, paidDate, paidAmount, now, billId, ctx.familyId);
+    db.prepare(
+      `INSERT INTO expenses (
+        id, family_id, description, category, subcategory, amount, date, payment_method,
+        responsible_name, responsible_uid, notes, status, is_installment, is_recurring,
+        fixed_bill_id, reference_month, created_by_uid, created_by_name, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pago', 0, 1, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      generateId('exp'),
+      ctx.familyId,
+      String(bill.name),
+      String(bill.category),
+      String(bill.subcategory),
+      paidAmount,
+      paidDate,
+      paymentMethod,
+      ctx.user.displayName,
+      ctx.user.uid,
+      'Pagamento de conta fixa',
+      billId,
+      paidMonth,
+      ctx.user.uid,
+      ctx.user.displayName,
+      now,
+      now
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'pagamento',
+      entityType: 'conta_fixa',
+      entityId: billId,
+      summary: `Conta fixa paga: ${String(bill.name)}`,
+      amount: paidAmount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.delete('/api/finance/fixed-bills/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const bill = db
+    .prepare('SELECT name FROM fixed_bills WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!bill) {
+    res.status(404).json({ error: 'Conta fixa não encontrada.' });
+    return;
+  }
+
+  runInTransaction(() => {
+    db.prepare('DELETE FROM fixed_bills WHERE id = ? AND family_id = ?').run(id, ctx.familyId);
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'excluir',
+      entityType: 'conta_fixa',
+      entityId: id,
+      summary: `Conta fixa removida: ${String(bill.name)}`,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/debts', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 100);
+  const creditor = clampText(body.creditor || 'Credor', 100);
+  const originalAmount = clampAmount(body.originalAmount);
+  const currentAmount = clampAmount(body.currentAmount);
+  const installmentAmount = clampAmount(body.installmentAmount);
+  const totalInstallments = Math.max(1, Math.round(Number(body.totalInstallments) || 1));
+  const paidInstallments = Math.max(0, Math.round(Number(body.paidInstallments) || 0));
+  const interestRate = Math.max(0, Number(body.interestRate) || 0);
+  const dueDate = normalizeIsoDate(body.dueDate, getTodayBrazilISO());
+  const notes = clampText(body.notes, 500);
+  const status = currentAmount <= 0 ? 'quitada' : 'ativa';
+
+  if (!name) {
+    res.status(400).json({ error: 'Informe o nome da dívida.' });
+    return;
+  }
+
+  const id = generateId('dbt');
   const now = new Date().toISOString();
 
   runInTransaction(() => {
@@ -1896,7 +1887,7 @@ app.post('/api/finance/debts', requireAuth, requireFamily, (req: AuthedRequest, 
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
-      familyId,
+      ctx.familyId,
       name,
       creditor,
       originalAmount,
@@ -1908,76 +1899,57 @@ app.post('/api/finance/debts', requireAuth, requireFamily, (req: AuthedRequest, 
       dueDate,
       status,
       notes,
-      user.uid,
-      user.display_name,
+      ctx.user.uid,
+      ctx.user.displayName,
       now,
       now
     );
     insertAuditLog({
-      familyId,
+      familyId: ctx.familyId,
       action: 'criar',
-      entityType: 'Dívida',
+      entityType: 'divida',
       entityId: id,
-      summary: `Cadastrou dívida "${name}" (${formatBRLServer(currentAmount)})`,
+      summary: `Dívida cadastrada: ${name}`,
       amount: currentAmount,
-      user,
+      user: ctx.user,
     });
   });
 
-  broadcastFamilySync(familyId, 'finance');
-  res.status(201).json(getFinanceSnapshot(familyId));
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.put('/api/finance/debts/:id', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const familyId = user.family_id!;
-  const id = sanitizeId(req.params.id);
-  const body = req.body as Record<string, unknown>;
-
-  if (!id) {
-    res.status(400).json({ error: 'Identificador inválido.' });
-    return;
-  }
-
-  const name = clampText(body.name, MAX_LENGTHS.debtName);
-  const creditor = clampText(body.creditor, MAX_LENGTHS.creditor) || 'Credor';
-  const originalAmount = clampAmount(body.originalAmount);
-  const currentAmount = clampAmount(body.currentAmount);
-  const installmentAmount = clampAmount(body.installmentAmount);
-  const totalInstallments = Math.max(
-    1,
-    Math.min(Math.round(Number(body.totalInstallments || 1)), 600)
-  );
-  const paidInstallments = Math.max(
-    0,
-    Math.min(Math.round(Number(body.paidInstallments || 0)), totalInstallments)
-  );
-  const rawInterest = Number(body.interestRate || 0);
-  const interestRate = Number.isFinite(rawInterest) ? Math.max(0, Math.min(rawInterest, 1000)) : 0;
-  const dueDate = sanitizeDateISO(body.dueDate);
-  const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-  if (!name || originalAmount <= 0 || !dueDate) {
-    res.status(400).json({ error: 'Preencha nome, valor original maior que zero e data válida.' });
-    return;
-  }
-
+app.put('/api/finance/debts/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
   const existing = db
     .prepare('SELECT id FROM debts WHERE id = ? AND family_id = ?')
-    .get(id, familyId);
+    .get(id, ctx.familyId);
   if (!existing) {
     res.status(404).json({ error: 'Dívida não encontrada.' });
     return;
   }
 
-  const status = currentAmount <= 0 || paidInstallments >= totalInstallments ? 'quitada' : 'ativa';
-  const now = new Date().toISOString();
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 100);
+  const creditor = clampText(body.creditor || 'Credor', 100);
+  const originalAmount = clampAmount(body.originalAmount);
+  const currentAmount = clampAmount(body.currentAmount);
+  const installmentAmount = clampAmount(body.installmentAmount);
+  const totalInstallments = Math.max(1, Math.round(Number(body.totalInstallments) || 1));
+  const paidInstallments = Math.max(0, Math.round(Number(body.paidInstallments) || 0));
+  const interestRate = Math.max(0, Number(body.interestRate) || 0);
+  const dueDate = normalizeIsoDate(body.dueDate, getTodayBrazilISO());
+  const notes = clampText(body.notes, 500);
+  const status = currentAmount <= 0 ? 'quitada' : 'ativa';
 
   runInTransaction(() => {
     db.prepare(
-      `UPDATE debts
-       SET name = ?, creditor = ?, original_amount = ?, current_amount = ?, installment_amount = ?,
-           total_installments = ?, paid_installments = ?, interest_rate = ?, due_date = ?, status = ?, notes = ?, updated_at = ?
+      `UPDATE debts SET
+        name = ?, creditor = ?, original_amount = ?, current_amount = ?, installment_amount = ?,
+        total_installments = ?, paid_installments = ?, interest_rate = ?, due_date = ?,
+        status = ?, notes = ?, updated_at = ?
        WHERE id = ? AND family_id = ?`
     ).run(
       name,
@@ -1991,621 +1963,636 @@ app.put('/api/finance/debts/:id', requireAuth, requireFamily, (req: AuthedReques
       dueDate,
       status,
       notes,
-      now,
+      new Date().toISOString(),
       id,
-      familyId
+      ctx.familyId
     );
     insertAuditLog({
-      familyId,
+      familyId: ctx.familyId,
       action: 'editar',
-      entityType: 'Dívida',
+      entityType: 'divida',
       entityId: id,
-      summary: `Editou dívida "${name}"`,
+      summary: `Dívida editada: ${name}`,
       amount: currentAmount,
-      user,
+      user: ctx.user,
     });
   });
 
-  broadcastFamilySync(familyId, 'finance');
-  res.json(getFinanceSnapshot(familyId));
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.post(
-  '/api/finance/debts/:id/pay',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    const body = req.body as Record<string, unknown>;
-
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const payVal = clampAmount(body.amount);
-    const date = sanitizeDateISO(body.date);
-    const paymentType =
-      typeof body.paymentType === 'string' && VALID_PAYMENT_TYPES.has(body.paymentType)
-        ? (body.paymentType as 'parcela' | 'parcial' | 'quitacao')
-        : 'parcela';
-    const recordAsExpense = Boolean(body.recordAsExpense);
-    const paymentMethod = clampText(body.paymentMethod, MAX_LENGTHS.paymentMethod) || 'PIX';
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-    if (payVal <= 0 || !date) {
-      res.status(400).json({ error: 'Informe um valor de pagamento maior que zero e data válida.' });
-      return;
-    }
-
-    const debt = db
-      .prepare('SELECT * FROM debts WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as Record<string, unknown> | undefined;
-    if (!debt) {
-      res.status(404).json({ error: 'Dívida não encontrada.' });
-      return;
-    }
-    if (debt.status === 'quitada') {
-      res.status(409).json({ error: 'Esta dívida já está quitada.' });
-      return;
-    }
-
-    const curAmount = Number(debt.current_amount);
-    const totalInst = Number(debt.total_installments);
-    const paidInst = Number(debt.paid_installments);
-
-    const newCurrentAmount =
-      paymentType === 'quitacao' ? 0 : Math.max(0, clampAmount(curAmount - payVal));
-    let newPaidInstallments = paidInst;
-    if (paymentType === 'quitacao' || newCurrentAmount === 0) {
-      newPaidInstallments = totalInst;
-    } else if (paymentType === 'parcela') {
-      newPaidInstallments = Math.min(totalInst, paidInst + 1);
-    }
-    const nextStatus = newCurrentAmount <= 0 ? 'quitada' : 'ativa';
-
-    const paymentId = generateDocId('dpay');
-    const now = new Date().toISOString();
-
-    runInTransaction(() => {
-      db.prepare(
-        `INSERT INTO debt_payments (
-          id, family_id, debt_id, debt_name, amount, date, payment_type, notes, created_by_uid, created_by_name, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        paymentId,
-        familyId,
-        id,
-        clampText(debt.name, MAX_LENGTHS.debtName),
-        payVal,
-        date,
-        paymentType,
-        notes,
-        user.uid,
-        user.display_name,
-        now
-      );
-
-      db.prepare(
-        'UPDATE debts SET current_amount = ?, paid_installments = ?, status = ?, updated_at = ? WHERE id = ? AND family_id = ?'
-      ).run(newCurrentAmount, newPaidInstallments, nextStatus, now, id, familyId);
-
-      if (recordAsExpense) {
-        const expId = generateDocId('exp');
-        db.prepare(
-          `INSERT INTO expenses (
-            id, family_id, description, category, subcategory, amount, date, payment_method,
-            responsible_name, responsible_uid, notes, status, is_installment,
-            installment_group_id, installment_number, total_installments, is_recurring,
-            fixed_bill_id, reference_month, created_by_uid, created_by_name, created_at, updated_at
-          ) VALUES (?, ?, ?, 'Contas da Casa', 'Financiamento', ?, ?, ?, ?, ?, ?, 'pago', 0, NULL, NULL, NULL, 0, NULL, ?, ?, ?, ?, ?)`
-        ).run(
-          expId,
-          familyId,
-          clampText(`Pagamento dívida: ${String(debt.name)}`, MAX_LENGTHS.description),
-          payVal,
-          date,
-          paymentMethod,
-          user.display_name,
-          user.uid,
-          clampText(notes || `Amortização registrada para ${String(debt.creditor)}`, MAX_LENGTHS.notes),
-          date.slice(0, 7),
-          user.uid,
-          user.display_name,
-          now,
-          now
-        );
-      }
-
-      insertAuditLog({
-        familyId,
-        action: 'pagamento',
-        entityType: 'Dívida',
-        entityId: id,
-        summary:
-          nextStatus === 'quitada'
-            ? `Quitou a dívida "${String(debt.name)}" com pagamento de ${formatBRLServer(payVal)}`
-            : `Registrou pagamento de ${formatBRLServer(payVal)} na dívida "${String(debt.name)}"`,
-        amount: payVal,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
+app.post('/api/finance/debts/:id/pay', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const debtId = String(req.params.id || '');
+  const debt = db
+    .prepare('SELECT * FROM debts WHERE id = ? AND family_id = ?')
+    .get(debtId, ctx.familyId) as Row | undefined;
+  if (!debt) {
+    res.status(404).json({ error: 'Dívida não encontrada.' });
+    return;
   }
-);
 
-app.delete(
-  '/api/finance/debts/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const row = db
-      .prepare('SELECT id, name, current_amount FROM debts WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as { id: string; name: string; current_amount: number } | undefined;
-    if (!row) {
-      res.status(404).json({ error: 'Dívida não encontrada.' });
-      return;
-    }
-
-    runInTransaction(() => {
-      db.prepare('DELETE FROM debts WHERE id = ? AND family_id = ?').run(id, familyId);
-      insertAuditLog({
-        familyId,
-        action: 'excluir',
-        entityType: 'Dívida',
-        entityId: id,
-        summary: `Excluiu dívida "${row.name}"`,
-        amount: Number(row.current_amount),
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
+  const body = (req.body || {}) as Record<string, unknown>;
+  const payAmount = clampAmount(body.amount);
+  if (payAmount <= 0) {
+    res.status(400).json({ error: 'Informe um valor positivo para pagamento.' });
+    return;
   }
-);
 
-// --- RESERVES ---
-app.post(
-  '/api/finance/reserves',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const body = req.body as Record<string, unknown>;
-
-    const name = clampText(body.name, MAX_LENGTHS.goalName);
-    const targetAmount = clampAmount(body.targetAmount);
-    const monthlyContribution = clampAmount(body.monthlyContribution);
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-    if (!name || targetAmount <= 0) {
-      res.status(400).json({ error: 'Informe nome e valor da meta maior que zero.' });
-      return;
-    }
-
-    const id = generateDocId('res');
-    const now = new Date().toISOString();
-
-    runInTransaction(() => {
-      db.prepare(
-        `INSERT INTO reserves (
-          id, family_id, name, target_amount, current_amount, monthly_contribution, notes,
-          created_by_uid, created_by_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        id,
-        familyId,
-        name,
-        targetAmount,
-        monthlyContribution,
-        notes,
-        user.uid,
-        user.display_name,
-        now,
-        now
-      );
-
-      insertAuditLog({
-        familyId,
-        action: 'reserva',
-        entityType: 'Reserva',
-        entityId: id,
-        summary: `Criou meta de economia "${name}" (${formatBRLServer(targetAmount)})`,
-        amount: targetAmount,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.status(201).json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.put(
-  '/api/finance/reserves/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    const body = req.body as Record<string, unknown>;
-
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const name = clampText(body.name, MAX_LENGTHS.goalName);
-    const targetAmount = clampAmount(body.targetAmount);
-    const monthlyContribution = clampAmount(body.monthlyContribution);
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-    if (!name || targetAmount <= 0) {
-      res.status(400).json({ error: 'Informe nome e valor da meta maior que zero.' });
-      return;
-    }
-
-    const existing = db
-      .prepare('SELECT id FROM reserves WHERE id = ? AND family_id = ?')
-      .get(id, familyId);
-    if (!existing) {
-      res.status(404).json({ error: 'Meta de reserva não encontrada.' });
-      return;
-    }
-
-    const now = new Date().toISOString();
-    runInTransaction(() => {
-      db.prepare(
-        `UPDATE reserves
-         SET name = ?, target_amount = ?, monthly_contribution = ?, notes = ?, updated_at = ?
-         WHERE id = ? AND family_id = ?`
-      ).run(name, targetAmount, monthlyContribution, notes, now, id, familyId);
-      insertAuditLog({
-        familyId,
-        action: 'editar',
-        entityType: 'Reserva',
-        entityId: id,
-        summary: `Atualizou meta "${name}"`,
-        amount: targetAmount,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.post(
-  '/api/finance/reserves/:id/move',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    const body = req.body as Record<string, unknown>;
-
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const type = body.type === 'retirada' ? 'retirada' : 'deposito';
-    const val = clampAmount(body.amount);
-    const date = sanitizeDateISO(body.date);
-    const notes = clampText(body.notes, MAX_LENGTHS.notes);
-
-    if (val <= 0 || !date) {
-      res.status(400).json({ error: 'Informe um valor maior que zero e data válida.' });
-      return;
-    }
-
-    const goal = db
-      .prepare('SELECT * FROM reserves WHERE id = ? AND family_id = ?')
-      .get(id, familyId) as Record<string, unknown> | undefined;
-    if (!goal) {
-      res.status(404).json({ error: 'Meta de reserva não encontrada.' });
-      return;
-    }
-
-    const currentAmount = Number(goal.current_amount);
-    if (type === 'retirada' && val > currentAmount) {
-      res.status(400).json({
-        error: 'O valor da retirada não pode ser maior que o saldo guardado nesta meta.',
-      });
-      return;
-    }
-
-    const nextAmount =
-      type === 'deposito'
-        ? clampAmount(currentAmount + val)
-        : Math.max(0, clampAmount(currentAmount - val));
-
-    const movId = generateDocId('rmov');
-    const now = new Date().toISOString();
-
-    runInTransaction(() => {
-      db.prepare(
-        `INSERT INTO reserve_movements (
-          id, family_id, goal_id, goal_name, type, amount, date, notes, created_by_uid, created_by_name, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        movId,
-        familyId,
-        id,
-        clampText(goal.name, MAX_LENGTHS.goalName),
-        type,
-        val,
-        date,
-        notes,
-        user.uid,
-        user.display_name,
-        now
-      );
-
-      db.prepare('UPDATE reserves SET current_amount = ?, updated_at = ? WHERE id = ? AND family_id = ?').run(
-        nextAmount,
-        now,
-        id,
-        familyId
-      );
-
-      insertAuditLog({
-        familyId,
-        action: 'reserva',
-        entityType: 'Reserva',
-        entityId: id,
-        summary:
-          type === 'deposito'
-            ? `Guardou ${formatBRLServer(val)} na meta "${String(goal.name)}"`
-            : `Retirou ${formatBRLServer(val)} da meta "${String(goal.name)}"`,
-        amount: val,
-        user,
-      });
-    });
-
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-app.delete(
-  '/api/finance/reserves/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    const existing = db
-      .prepare('SELECT id FROM reserves WHERE id = ? AND family_id = ?')
-      .get(id, familyId);
-    if (!existing) {
-      res.status(404).json({ error: 'Meta de reserva não encontrada.' });
-      return;
-    }
-
-    db.prepare('DELETE FROM reserves WHERE id = ? AND family_id = ?').run(id, familyId);
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
-  }
-);
-
-// --- BUDGETS ---
-app.post('/api/finance/budgets', requireAuth, requireFamily, (req: AuthedRequest, res: Response) => {
-  const user = req.authUser!;
-  const familyId = user.family_id!;
-  const body = req.body as Record<string, unknown>;
-
-  const category = clampText(body.category, MAX_LENGTHS.category);
-  const monthlyLimit = clampAmount(body.monthlyLimit);
-  const existingId = sanitizeId(body.existingId);
+  const payDate = normalizeIsoDate(body.date, getTodayBrazilISO());
+  const paymentType =
+    body.paymentType === 'parcial' || body.paymentType === 'quitacao'
+      ? body.paymentType
+      : 'parcela';
+  const currentAmt = Number(debt.current_amount);
+  const nextCurrent =
+    paymentType === 'quitacao'
+      ? 0
+      : Math.max(0, Math.round((currentAmt - payAmount) * 100) / 100);
+  const totalInst = Number(debt.total_installments);
+  const paidInst = Number(debt.paid_installments);
+  const nextPaidInst =
+    paymentType === 'quitacao'
+      ? totalInst
+      : paymentType === 'parcela'
+      ? Math.min(totalInst, paidInst + 1)
+      : paidInst;
+  const nextStatus = nextCurrent <= 0 ? 'quitada' : 'ativa';
   const now = new Date().toISOString();
 
-  if (existingId) {
-    const existing = db
-      .prepare('SELECT id FROM budgets WHERE id = ? AND family_id = ?')
-      .get(existingId, familyId);
-    if (!existing) {
-      res.status(404).json({ error: 'Orçamento não encontrado.' });
-      return;
-    }
-    db.prepare('UPDATE budgets SET monthly_limit = ?, updated_at = ? WHERE id = ? AND family_id = ?').run(
-      monthlyLimit,
-      now,
-      existingId,
-      familyId
-    );
-  } else {
-    if (!category) {
-      res.status(400).json({ error: 'Informe a categoria do orçamento.' });
-      return;
-    }
-    const id = generateDocId('bud');
+  runInTransaction(() => {
     db.prepare(
-      `INSERT INTO budgets (
-        id, family_id, category, monthly_limit, month, created_by_uid, created_by_name, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'padrao', ?, ?, ?, ?)`
-    ).run(id, familyId, category, monthlyLimit, user.uid, user.display_name, now, now);
-  }
+      'UPDATE debts SET current_amount = ?, paid_installments = ?, status = ?, updated_at = ? WHERE id = ? AND family_id = ?'
+    ).run(nextCurrent, nextPaidInst, nextStatus, now, debtId, ctx.familyId);
+    db.prepare(
+      `INSERT INTO debt_payments (
+        id, family_id, debt_id, debt_name, amount, date, payment_type, notes,
+        created_by_uid, created_by_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      generateId('dpay'),
+      ctx.familyId,
+      debtId,
+      String(debt.name),
+      payAmount,
+      payDate,
+      paymentType,
+      clampText(body.notes, 500),
+      ctx.user.uid,
+      ctx.user.displayName,
+      now
+    );
+    if (body.recordAsExpense) {
+      db.prepare(
+        `INSERT INTO expenses (
+          id, family_id, description, category, subcategory, amount, date, payment_method,
+          responsible_name, responsible_uid, notes, status, is_installment, is_recurring,
+          reference_month, created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, 'Outras Despesas', 'Outros', ?, ?, ?, ?, ?, ?, 'pago', 0, 0, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('exp'),
+        ctx.familyId,
+        clampText(`Amortização de dívida: ${String(debt.name)}`, 140),
+        payAmount,
+        payDate,
+        clampText(body.paymentMethod || 'PIX', 40),
+        ctx.user.displayName,
+        ctx.user.uid,
+        clampText(body.notes || `Credor: ${String(debt.creditor)}`, 500),
+        payDate.slice(0, 7),
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
+      );
+    }
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'pagamento',
+      entityType: 'divida',
+      entityId: debtId,
+      summary: `Pagamento registrado na dívida ${String(debt.name)}`,
+      amount: payAmount,
+      user: ctx.user,
+    });
+  });
 
-  broadcastFamilySync(familyId, 'finance');
-  res.json(getFinanceSnapshot(familyId));
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
 });
 
-app.delete(
-  '/api/finance/budgets/:id',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const id = sanitizeId(req.params.id);
-    if (!id) {
-      res.status(400).json({ error: 'Identificador inválido.' });
-      return;
-    }
-
-    db.prepare('DELETE FROM budgets WHERE id = ? AND family_id = ?').run(id, familyId);
-    broadcastFamilySync(familyId, 'finance');
-    res.json(getFinanceSnapshot(familyId));
+app.delete('/api/finance/debts/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const debt = db
+    .prepare('SELECT name FROM debts WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!debt) {
+    res.status(404).json({ error: 'Dívida não encontrada.' });
+    return;
   }
-);
 
-// --- BACKUP RESTORE ---
-app.post(
-  '/api/finance/restore-backup',
-  requireAuth,
-  requireFamily,
-  (req: AuthedRequest, res: Response) => {
-    const user = req.authUser!;
-    const familyId = user.family_id!;
-    const body = req.body as Record<string, unknown>;
-    const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  runInTransaction(() => {
+    db.prepare('DELETE FROM debts WHERE id = ? AND family_id = ?').run(id, ctx.familyId);
+    db.prepare('DELETE FROM debt_payments WHERE debt_id = ? AND family_id = ?').run(
+      id,
+      ctx.familyId
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'excluir',
+      entityType: 'divida',
+      entityId: id,
+      summary: `Dívida removida: ${String(debt.name)}`,
+      user: ctx.user,
+    });
+  });
 
-    if (!currentPassword || !verifySecret(currentPassword, user.password_hash)) {
-      res.status(401).json({ error: 'Senha incorreta. Confirme sua identidade para prosseguir.' });
-      return;
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/reserves', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 100);
+  const targetAmount = clampAmount(body.targetAmount);
+  const monthlyContribution = clampAmount(body.monthlyContribution);
+  const notes = clampText(body.notes, 500);
+
+  if (!name || targetAmount <= 0) {
+    res.status(400).json({ error: 'Informe nome e valor objetivo para a reserva.' });
+    return;
+  }
+
+  const id = generateId('res');
+  const now = new Date().toISOString();
+
+  runInTransaction(() => {
+    db.prepare(
+      `INSERT INTO reserves (
+        id, family_id, name, target_amount, current_amount, monthly_contribution, notes,
+        created_by_uid, created_by_name, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      id,
+      ctx.familyId,
+      name,
+      targetAmount,
+      monthlyContribution,
+      notes,
+      ctx.user.uid,
+      ctx.user.displayName,
+      now,
+      now
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'reserva',
+      entityType: 'reserva',
+      entityId: id,
+      summary: `Meta de reserva criada: ${name}`,
+      amount: targetAmount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.put('/api/finance/reserves/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const existing = db
+    .prepare('SELECT id FROM reserves WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId);
+  if (!existing) {
+    res.status(404).json({ error: 'Meta de reserva não encontrada.' });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const name = clampText(body.name, 100);
+  const targetAmount = clampAmount(body.targetAmount);
+  const monthlyContribution = clampAmount(body.monthlyContribution);
+  const notes = clampText(body.notes, 500);
+
+  runInTransaction(() => {
+    db.prepare(
+      `UPDATE reserves SET name = ?, target_amount = ?, monthly_contribution = ?, notes = ?, updated_at = ?
+       WHERE id = ? AND family_id = ?`
+    ).run(
+      name,
+      targetAmount,
+      monthlyContribution,
+      notes,
+      new Date().toISOString(),
+      id,
+      ctx.familyId
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'editar',
+      entityType: 'reserva',
+      entityId: id,
+      summary: `Meta de reserva atualizada: ${name}`,
+      amount: targetAmount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/reserves/:id/move', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const goalId = String(req.params.id || '');
+  const goal = db
+    .prepare('SELECT * FROM reserves WHERE id = ? AND family_id = ?')
+    .get(goalId, ctx.familyId) as Row | undefined;
+  if (!goal) {
+    res.status(404).json({ error: 'Meta de reserva não encontrada.' });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const type = body.type === 'retirada' ? 'retirada' : 'deposito';
+  const amount = clampAmount(body.amount);
+  if (amount <= 0) {
+    res.status(400).json({ error: 'Informe um valor positivo.' });
+    return;
+  }
+
+  const current = Number(goal.current_amount);
+  const nextAmount =
+    type === 'deposito'
+      ? Math.round((current + amount) * 100) / 100
+      : Math.max(0, Math.round((current - amount) * 100) / 100);
+  const moveDate = normalizeIsoDate(body.date, getTodayBrazilISO());
+  const now = new Date().toISOString();
+
+  runInTransaction(() => {
+    db.prepare(
+      'UPDATE reserves SET current_amount = ?, updated_at = ? WHERE id = ? AND family_id = ?'
+    ).run(nextAmount, now, goalId, ctx.familyId);
+    db.prepare(
+      `INSERT INTO reserve_movements (
+        id, family_id, goal_id, goal_name, type, amount, date, notes,
+        created_by_uid, created_by_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      generateId('rmv'),
+      ctx.familyId,
+      goalId,
+      String(goal.name),
+      type,
+      amount,
+      moveDate,
+      clampText(body.notes, 500),
+      ctx.user.uid,
+      ctx.user.displayName,
+      now
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'reserva',
+      entityType: 'reserva',
+      entityId: goalId,
+      summary: `${type === 'deposito' ? 'Depósito' : 'Retirada'} em ${String(goal.name)}`,
+      amount,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.delete('/api/finance/reserves/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const goal = db
+    .prepare('SELECT name FROM reserves WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!goal) {
+    res.status(404).json({ error: 'Meta de reserva não encontrada.' });
+    return;
+  }
+
+  runInTransaction(() => {
+    db.prepare('DELETE FROM reserves WHERE id = ? AND family_id = ?').run(id, ctx.familyId);
+    db.prepare('DELETE FROM reserve_movements WHERE goal_id = ? AND family_id = ?').run(
+      id,
+      ctx.familyId
+    );
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'excluir',
+      entityType: 'reserva',
+      entityId: id,
+      summary: `Meta de reserva excluída: ${String(goal.name)}`,
+      user: ctx.user,
+    });
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/budgets', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const body = (req.body || {}) as Record<string, unknown>;
+  const category = clampText(body.category, 60);
+  const monthlyLimit = clampAmount(body.monthlyLimit);
+  const existingId = typeof body.existingId === 'string' ? body.existingId : undefined;
+
+  if (!category || monthlyLimit <= 0) {
+    res.status(400).json({ error: 'Informe categoria e limite mensal positivo.' });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  runInTransaction(() => {
+    if (existingId) {
+      db.prepare(
+        'UPDATE budgets SET category = ?, monthly_limit = ?, updated_at = ? WHERE id = ? AND family_id = ?'
+      ).run(category, monthlyLimit, now, existingId, ctx.familyId);
+      insertAuditLog({
+        familyId: ctx.familyId,
+        action: 'editar',
+        entityType: 'orcamento',
+        entityId: existingId,
+        summary: `Limite atualizado para ${category}`,
+        amount: monthlyLimit,
+        user: ctx.user,
+      });
+    } else {
+      const id = generateId('bdg');
+      db.prepare(
+        `INSERT INTO budgets (
+          id, family_id, category, monthly_limit, month, created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'padrao', ?, ?, ?, ?)`
+      ).run(id, ctx.familyId, category, monthlyLimit, ctx.user.uid, ctx.user.displayName, now, now);
+      insertAuditLog({
+        familyId: ctx.familyId,
+        action: 'criar',
+        entityType: 'orcamento',
+        entityId: id,
+        summary: `Limite definido para ${category}`,
+        amount: monthlyLimit,
+        user: ctx.user,
+      });
     }
+  });
 
-    const backup = body.backup as Record<string, unknown> | undefined;
-    if (!backup || backup.app !== 'Blessed Finance' || !Array.isArray(backup.incomes)) {
-      res.status(400).json({ error: 'Arquivo de backup inválido ou incompatível.' });
-      return;
-    }
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
 
-    const fallbackDate = `${getTodayBrazilISO().slice(0, 7)}-01`;
-    const now = new Date().toISOString();
-    let restoredCount = 0;
+app.delete('/api/finance/budgets/:id', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+  const id = String(req.params.id || '');
+  const row = db
+    .prepare('SELECT category FROM budgets WHERE id = ? AND family_id = ?')
+    .get(id, ctx.familyId) as Row | undefined;
+  if (!row) {
+    res.status(404).json({ error: 'Orçamento não encontrado.' });
+    return;
+  }
 
-    runInTransaction(() => {
-      const existingIncomeRows = db
-        .prepare('SELECT id FROM incomes WHERE family_id = ?')
-        .all(familyId) as Array<{ id: string }>;
-      const existingIncomeIds = new Set(existingIncomeRows.map((r) => r.id));
+  runInTransaction(() => {
+    db.prepare('DELETE FROM budgets WHERE id = ? AND family_id = ?').run(id, ctx.familyId);
+    insertAuditLog({
+      familyId: ctx.familyId,
+      action: 'excluir',
+      entityType: 'orcamento',
+      entityId: id,
+      summary: `Limite removido: ${String(row.category)}`,
+      user: ctx.user,
+    });
+  });
 
-      const incStmt = db.prepare(
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json(getFamilySnapshot(ctx.familyId));
+});
+
+app.post('/api/finance/restore-backup', requireAuth, (req: RequestWithUser, res: Response) => {
+  const ctx = requireFamily(req, res);
+  if (!ctx) return;
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const currentPassword = typeof body.currentPassword === 'string' ? body.currentPassword : '';
+  const userRow = db
+    .prepare('SELECT password_hash FROM users WHERE uid = ?')
+    .get(ctx.user.uid) as Row | undefined;
+  if (!userRow || !verifySecret(currentPassword, String(userRow.password_hash))) {
+    res.status(401).json({ error: 'Senha atual incorreta.' });
+    return;
+  }
+
+  const backup = (body.backup || {}) as Record<string, unknown[]>;
+  const now = new Date().toISOString();
+  let restoredCount = 0;
+
+  runInTransaction(() => {
+    for (const raw of backup.incomes || []) {
+      const item = (raw || {}) as Row;
+      const amount = clampAmount(item.amount);
+      const description = clampText(item.description, 140);
+      if (!description || amount <= 0) continue;
+      db.prepare(
         `INSERT INTO incomes (
           id, family_id, description, amount, date, category, responsible_name, responsible_uid, notes,
           created_by_uid, created_by_name, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('inc'),
+        ctx.familyId,
+        description,
+        amount,
+        normalizeIsoDate(item.date, getTodayBrazilISO()),
+        clampText(item.category || 'Outros recebimentos', 60),
+        clampText(item.responsibleName || ctx.user.displayName, 80),
+        ctx.user.uid,
+        clampText(item.notes, 500),
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
       );
-
-      const rawIncomes = Array.isArray(backup.incomes) ? backup.incomes : [];
-      for (const rawItem of rawIncomes.slice(0, 100)) {
-        if (!rawItem || typeof rawItem !== 'object') continue;
-        const item = rawItem as Record<string, unknown>;
-        const id = sanitizeId(item.id) || generateDocId('inc');
-        if (existingIncomeIds.has(id)) continue;
-        const amt = clampAmount(item.amount);
-        if (amt <= 0) continue;
-        incStmt.run(
-          id,
-          familyId,
-          clampText(item.description, MAX_LENGTHS.description) || 'Receita restaurada',
-          amt,
-          sanitizeDateISO(item.date) || fallbackDate,
-          clampText(item.category, MAX_LENGTHS.category) || 'Outros recebimentos',
-          clampText(item.responsibleName, MAX_LENGTHS.displayName) || user.display_name,
-          user.uid,
-          clampText(item.notes, MAX_LENGTHS.notes),
-          user.uid,
-          user.display_name,
-          now,
-          now
-        );
-        existingIncomeIds.add(id);
-        restoredCount++;
-      }
-
-      const existingExpenseRows = db
-        .prepare('SELECT id FROM expenses WHERE family_id = ?')
-        .all(familyId) as Array<{ id: string }>;
-      const existingExpenseIds = new Set(existingExpenseRows.map((r) => r.id));
-
-      const expStmt = db.prepare(
-        `INSERT INTO expenses (
-          id, family_id, description, category, subcategory, amount, date, payment_method,
-          responsible_name, responsible_uid, notes, status, is_installment,
-          installment_group_id, installment_number, total_installments, is_recurring,
-          fixed_bill_id, reference_month, created_by_uid, created_by_name, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, ?, ?, ?, ?, ?)`
-      );
-
-      const rawExpenses = Array.isArray(backup.expenses) ? backup.expenses : [];
-      for (const rawItem of rawExpenses.slice(0, 150)) {
-        if (!rawItem || typeof rawItem !== 'object') continue;
-        const item = rawItem as Record<string, unknown>;
-        const id = sanitizeId(item.id) || generateDocId('exp');
-        if (existingExpenseIds.has(id)) continue;
-        const amt = clampAmount(item.amount);
-        if (amt <= 0) continue;
-        const safeDate = sanitizeDateISO(item.date) || fallbackDate;
-        expStmt.run(
-          id,
-          familyId,
-          clampText(item.description, MAX_LENGTHS.description) || 'Despesa restaurada',
-          clampText(item.category, MAX_LENGTHS.category) || 'Outras Despesas',
-          clampText(item.subcategory, MAX_LENGTHS.subcategory) || 'Outros',
-          amt,
-          safeDate,
-          clampText(item.paymentMethod, MAX_LENGTHS.paymentMethod) || 'PIX',
-          clampText(item.responsibleName, MAX_LENGTHS.displayName) || user.display_name,
-          user.uid,
-          clampText(item.notes, MAX_LENGTHS.notes),
-          item.status === 'pendente' ? 'pendente' : 'pago',
-          item.isInstallment ? 1 : 0,
-          item.isRecurring ? 1 : 0,
-          safeDate.slice(0, 7),
-          user.uid,
-          user.display_name,
-          now,
-          now
-        );
-        existingExpenseIds.add(id);
-        restoredCount++;
-      }
-
-      if (restoredCount > 0) {
-        insertAuditLog({
-          familyId,
-          action: 'criar',
-          entityType: 'Backup',
-          entityId: generateDocId('bkp'),
-          summary: `Restaurou ${restoredCount} registro(s) a partir de backup JSON`,
-          user,
-        });
-      }
-    });
-
-    if (restoredCount > 0) {
-      broadcastFamilySync(familyId, 'finance');
+      restoredCount += 1;
     }
 
-    res.json({ restoredCount, snapshot: getFinanceSnapshot(familyId) });
-  }
-);
+    for (const raw of backup.expenses || []) {
+      const item = (raw || {}) as Row;
+      const amount = clampAmount(item.amount);
+      const description = clampText(item.description, 140);
+      if (!description || amount <= 0) continue;
+      const date = normalizeIsoDate(item.date, getTodayBrazilISO());
+      db.prepare(
+        `INSERT INTO expenses (
+          id, family_id, description, category, subcategory, amount, date, payment_method,
+          responsible_name, responsible_uid, notes, status, is_installment, is_recurring,
+          reference_month, created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('exp'),
+        ctx.familyId,
+        description,
+        clampText(item.category || 'Outras Despesas', 60),
+        clampText(item.subcategory || 'Outros', 60),
+        amount,
+        date,
+        clampText(item.paymentMethod || 'PIX', 40),
+        clampText(item.responsibleName || ctx.user.displayName, 80),
+        ctx.user.uid,
+        clampText(item.notes, 500),
+        item.status === 'pendente' ? 'pendente' : 'pago',
+        date.slice(0, 7),
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
+      );
+      restoredCount += 1;
+    }
+
+    for (const raw of backup.fixedBills || []) {
+      const item = (raw || {}) as Row;
+      const name = clampText(item.name, 100);
+      const expectedAmount = clampAmount(item.expectedAmount);
+      if (!name || expectedAmount <= 0) continue;
+      db.prepare(
+        `INSERT INTO fixed_bills (
+          id, family_id, name, expected_amount, due_day, frequency, category, subcategory,
+          last_paid_month, last_paid_date, last_paid_amount, active, notes,
+          created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', 0, 1, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('bill'),
+        ctx.familyId,
+        name,
+        expectedAmount,
+        Math.max(1, Math.min(31, Math.round(Number(item.dueDay) || 10))),
+        normalizeFrequency(item.frequency),
+        clampText(item.category || 'Contas da Casa', 60),
+        clampText(item.subcategory || 'Outras contas', 60),
+        clampText(item.notes, 500),
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
+      );
+      restoredCount += 1;
+    }
+
+    for (const raw of backup.debts || []) {
+      const item = (raw || {}) as Row;
+      const name = clampText(item.name, 100);
+      if (!name) continue;
+      const currentAmount = clampAmount(item.currentAmount);
+      db.prepare(
+        `INSERT INTO debts (
+          id, family_id, name, creditor, original_amount, current_amount, installment_amount,
+          total_installments, paid_installments, interest_rate, due_date, status, notes,
+          created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('dbt'),
+        ctx.familyId,
+        name,
+        clampText(item.creditor || 'Credor', 100),
+        clampAmount(item.originalAmount),
+        currentAmount,
+        clampAmount(item.installmentAmount),
+        Math.max(1, Math.round(Number(item.totalInstallments) || 1)),
+        Math.max(0, Math.round(Number(item.paidInstallments) || 0)),
+        Math.max(0, Number(item.interestRate) || 0),
+        normalizeIsoDate(item.dueDate, getTodayBrazilISO()),
+        currentAmount <= 0 ? 'quitada' : 'ativa',
+        clampText(item.notes, 500),
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
+      );
+      restoredCount += 1;
+    }
+
+    for (const raw of backup.reserves || []) {
+      const item = (raw || {}) as Row;
+      const name = clampText(item.name, 100);
+      const targetAmount = clampAmount(item.targetAmount);
+      if (!name || targetAmount <= 0) continue;
+      db.prepare(
+        `INSERT INTO reserves (
+          id, family_id, name, target_amount, current_amount, monthly_contribution, notes,
+          created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        generateId('res'),
+        ctx.familyId,
+        name,
+        targetAmount,
+        clampAmount(item.currentAmount),
+        clampAmount(item.monthlyContribution),
+        clampText(item.notes, 500),
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
+      );
+      restoredCount += 1;
+    }
+
+    for (const raw of backup.budgets || []) {
+      const item = (raw || {}) as Row;
+      const category = clampText(item.category, 60);
+      const monthlyLimit = clampAmount(item.monthlyLimit);
+      if (!category || monthlyLimit <= 0) continue;
+      db.prepare(
+        `INSERT INTO budgets (
+          id, family_id, category, monthly_limit, month, created_by_uid, created_by_name, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'padrao', ?, ?, ?, ?)`
+      ).run(
+        generateId('bdg'),
+        ctx.familyId,
+        category,
+        monthlyLimit,
+        ctx.user.uid,
+        ctx.user.displayName,
+        now,
+        now
+      );
+      restoredCount += 1;
+    }
+
+    if (restoredCount > 0) {
+      insertAuditLog({
+        familyId: ctx.familyId,
+        action: 'criar',
+        entityType: 'backup',
+        entityId: ctx.familyId,
+        summary: `Backup restaurado: ${restoredCount} registro(s)`,
+        user: ctx.user,
+      });
+    }
+  });
+
+  broadcastFamilySync(ctx.familyId, 'finance');
+  res.json({ restoredCount, snapshot: getFamilySnapshot(ctx.familyId) });
+});
 
 app.use('/api/*', (_req: Request, res: Response) => {
   res.status(404).json({ error: 'Recurso não encontrado.' });
@@ -2628,7 +2615,11 @@ async function startServer() {
         maxAge: '1h',
       })
     );
-    app.get('*', (_req: Request, res: Response) => {
+    app.get('*', (req: Request, res: Response) => {
+      if (/\.(wasm|js|css|png|svg|ico|json|webmanifest|woff2?)$/i.test(req.path)) {
+        res.status(404).send('Arquivo não encontrado.');
+        return;
+      }
       const indexFile = path.resolve(distDir, 'index.html');
       if (fs.existsSync(indexFile)) {
         res.sendFile(indexFile);
@@ -2643,7 +2634,7 @@ async function startServer() {
   });
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Blessed Finance server listening on port ${PORT} (SQLite local database)`);
+    console.log(`Blessed Finance server listening on port ${PORT} (Built-in SQLite + PWA)`);
   });
 }
 

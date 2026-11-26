@@ -420,10 +420,11 @@ export function FamilySettingsView({ onNotify }: FamilySettingsViewProps) {
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-900">
-                Banco Local e Proteção da Sessão
+                Banco do App e Proteção da Sessão
               </h2>
               <p className="text-xs text-slate-600 mt-0.5">
-                Armazenamento SQLite dentro do próprio projeto Node.js, sem credenciais externas.
+                Banco de dados SQLite integrado ao aplicativo para você e sua esposa usarem juntos
+                no celular com sincronização automática.
               </p>
             </div>
           </div>
@@ -434,11 +435,15 @@ export function FamilySettingsView({ onNotify }: FamilySettingsViewProps) {
                 <Database className="w-3.5 h-3.5 text-[#0D3B2E]" />
                 Banco de dados
               </span>
-              <span className="font-semibold text-[#15803D]">SQLite local (no projeto)</span>
+              <span className="font-semibold text-[#15803D]">SQLite integrado ao app</span>
             </div>
             <div className="py-2.5 flex items-center justify-between gap-2">
               <span className="text-slate-600">Proteção de senhas</span>
-              <span className="font-semibold text-[#15803D]">Hash scrypt com salt no servidor</span>
+              <span className="font-semibold text-[#15803D]">Hash scrypt com salt exclusivo</span>
+            </div>
+            <div className="py-2.5 flex items-center justify-between gap-2">
+              <span className="text-slate-600">Sessão persistente segura</span>
+              <span className="font-semibold text-[#15803D]">Cookie protegido + cofre local</span>
             </div>
             <div className="py-2.5 flex items-center justify-between gap-2">
               <span className="text-slate-600">Bloqueio automático por inatividade</span>

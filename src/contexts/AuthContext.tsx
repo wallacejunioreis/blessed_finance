@@ -1,4 +1,9 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import {
+  clearEncryptedSessionToken,
+  loadEncryptedSessionToken,
+  saveEncryptedSessionToken,
+} from '../db/sessionVault';
 import { ApiError, apiRequest, setMemoryAuthToken } from '../services/api';
 import { Family, FamilyMember, FamilyRole, UserProfile } from '../types/finance';
 
@@ -9,7 +14,6 @@ interface AuthResponsePayload {
   family: Family | null;
   members: FamilyMember[];
   token?: string;
-  recoveryCode?: string;
 }
 
 interface AuthContextValue {
@@ -21,8 +25,6 @@ interface AuthContextValue {
   members: FamilyMember[];
   pendingInviteCode: string;
   setPendingInviteCode: (code: string) => void;
-  pendingRecoveryCode: string;
-  dismissRecoveryCode: () => void;
   signInWithEmail: (email: string, password: string) => Promise<void>;
   signUpWithEmail: (params: {
     name: string;
@@ -30,11 +32,9 @@ interface AuthContextValue {
     password: string;
     role: FamilyRole;
   }) => Promise<void>;
-  resetPasswordWithRecoveryCode: (params: {
-    email: string;
-    recoveryCode: string;
-    newPassword: string;
-  }) => Promise<void>;
+  requestRecoveryCode: (email: string) => Promise<void>;
+  verifyRecoveryCode: (email: string, code: string) => Promise<void>;
+  completePasswordReset: (params: { email: string; newPassword: string }) => Promise<void>;
   reauthenticateUser: (currentPassword: string) => Promise<void>;
   changeUserPassword: (currentPassword: string, newPassword: string) => Promise<void>;
   signOut: () => Promise<void>;
@@ -70,7 +70,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [authReady, setAuthReady] = useState(false);
   const [family, setFamily] = useState<Family | null>(null);
   const [members, setMembers] = useState<FamilyMember[]>([]);
-  const [pendingRecoveryCode, setPendingRecoveryCode] = useState('');
+  const [pendingResetToken, setPendingResetToken] = useState('');
   const [pendingInviteCode, setPendingInviteCode] = useState<string>(() => {
     try {
       const url = new URL(window.location.href);
@@ -88,9 +88,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   });
 
-  const applySessionPayload = useCallback((data: AuthResponsePayload) => {
+  const applySessionPayload = useCallback(async (data: AuthResponsePayload) => {
     if (data.token) {
       setMemoryAuthToken(data.token);
+      await saveEncryptedSessionToken(data.token);
     }
     setUser(data.user);
     setFamily(data.family);
@@ -99,15 +100,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const refreshSessionState = useCallback(async () => {
     try {
+      const storedToken = await loadEncryptedSessionToken();
+      if (storedToken) {
+        setMemoryAuthToken(storedToken);
+      }
       const data = await apiRequest<AuthResponsePayload>('/api/auth/me');
       if (!data.user) {
         setMemoryAuthToken(null);
+        await clearEncryptedSessionToken();
       }
       setUser(data.user);
       setFamily(data.family);
       setMembers(data.members || []);
     } catch {
-      // keep current state on transient network errors
+      // keep current state on transient network error
     } finally {
       setAuthReady(true);
     }
@@ -124,18 +130,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // ignore logout network errors
     }
     setMemoryAuthToken(null);
+    await clearEncryptedSessionToken();
     setUser(null);
     setFamily(null);
     setMembers([]);
-    setPendingRecoveryCode('');
+    setPendingResetToken('');
     try {
       sessionStorage.clear();
     } catch {
-      // ignore storage errors
+      // ignore
     }
   }, []);
 
-  // Automatic inactivity session timeout
+  // Automatic inactivity lock
   useEffect(() => {
     if (!user) return;
     let timer = setTimeout(() => {
@@ -163,15 +170,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       method: 'POST',
       body: { email: email.trim(), password },
     });
-    applySessionPayload(data);
+    await applySessionPayload(data);
   };
 
-  const signUpWithEmail = async ({
-    name,
-    email,
-    password,
-    role,
-  }: {
+  const signUpWithEmail = async (params: {
     name: string;
     email: string;
     password: string;
@@ -179,31 +181,51 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }) => {
     const data = await apiRequest<AuthResponsePayload>('/api/auth/register', {
       method: 'POST',
-      body: { name: name.trim(), email: email.trim(), password, role },
+      body: {
+        name: params.name.trim(),
+        email: params.email.trim(),
+        password: params.password,
+        role: params.role,
+      },
     });
-    if (data.recoveryCode) {
-      setPendingRecoveryCode(data.recoveryCode);
-    }
-    applySessionPayload(data);
+    await applySessionPayload(data);
   };
 
-  const dismissRecoveryCode = () => {
-    setPendingRecoveryCode('');
+  const requestRecoveryCode = async (email: string) => {
+    setPendingResetToken('');
+    await apiRequest('/api/recovery/request-code', {
+      method: 'POST',
+      body: { email: email.trim() },
+    });
   };
 
-  const resetPasswordWithRecoveryCode = async ({
+  const verifyRecoveryCode = async (email: string, code: string) => {
+    const res = await apiRequest<{ ok: boolean; resetToken: string }>('/api/recovery/verify-code', {
+      method: 'POST',
+      body: { email: email.trim(), code: code.replace(/\D/g, '') },
+    });
+    setPendingResetToken(res.resetToken || '');
+  };
+
+  const completePasswordReset = async ({
     email,
-    recoveryCode,
     newPassword,
   }: {
     email: string;
-    recoveryCode: string;
     newPassword: string;
   }) => {
-    await apiRequest('/api/auth/reset-password', {
+    if (!pendingResetToken) {
+      throw new Error('Valide o código de verificação primeiro.');
+    }
+    await apiRequest('/api/recovery/reset-password', {
       method: 'POST',
-      body: { email: email.trim(), recoveryCode: recoveryCode.trim(), newPassword },
+      body: {
+        email: email.trim(),
+        resetToken: pendingResetToken,
+        newPassword,
+      },
     });
+    setPendingResetToken('');
   };
 
   const reauthenticateUser = async (currentPassword: string) => {
@@ -220,55 +242,42 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     if (data.token) {
       setMemoryAuthToken(data.token);
+      await saveEncryptedSessionToken(data.token);
     }
   };
 
-  const createFamily = async ({
-    familyName,
-    displayName,
-    role,
-  }: {
+  const createFamily = async (params: {
     familyName: string;
     displayName: string;
     role: FamilyRole;
   }): Promise<string> => {
     const data = await apiRequest<AuthResponsePayload>('/api/family/create', {
       method: 'POST',
-      body: { familyName, displayName, role },
+      body: params,
     });
-    applySessionPayload(data);
+    await applySessionPayload(data);
     return data.family?.id || '';
   };
 
-  const joinFamilyByCode = async ({
-    inviteCode,
-    displayName,
-    role,
-  }: {
+  const joinFamilyByCode = async (params: {
     inviteCode: string;
     displayName: string;
     role: FamilyRole;
   }) => {
     const data = await apiRequest<AuthResponsePayload>('/api/family/join', {
       method: 'POST',
-      body: { inviteCode, displayName, role },
+      body: params,
     });
-    applySessionPayload(data);
+    await applySessionPayload(data);
     setPendingInviteCode('');
   };
 
-  const updateMyProfile = async ({
-    displayName,
-    role,
-  }: {
-    displayName: string;
-    role: FamilyRole;
-  }) => {
+  const updateMyProfile = async (params: { displayName: string; role: FamilyRole }) => {
     const data = await apiRequest<AuthResponsePayload>('/api/family/profile', {
       method: 'PATCH',
-      body: { displayName, role },
+      body: params,
     });
-    applySessionPayload(data);
+    await applySessionPayload(data);
   };
 
   const updateFamilyName = async (name: string) => {
@@ -324,11 +333,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         members,
         pendingInviteCode,
         setPendingInviteCode,
-        pendingRecoveryCode,
-        dismissRecoveryCode,
         signInWithEmail,
         signUpWithEmail,
-        resetPasswordWithRecoveryCode,
+        requestRecoveryCode,
+        verifyRecoveryCode,
+        completePasswordReset,
         reauthenticateUser,
         changeUserPassword,
         signOut,
